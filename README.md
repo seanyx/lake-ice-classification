@@ -10,17 +10,17 @@ Google Earth Engine interface to aid building training data for classifying ice 
 
 ## Categories:
 
-Cat1. partial_img_cover: add a polygon of this category if Landsat image does not fully cover the lake polygon
-Cat2. snow: lake surface covered by snow
-Cat3. opaque_ice: lake surface covered by opaque ice
-Cat4. clear_ice: lake surface covered by clear ice
-Cat5. water: lake water surface
-Cat6. cloudy_opaque_ice: opaque ice cover on lakes seen through thin cloud cover
-Cat7. cloudy_clear_ice: clear ice cover on lakes seen through thin cloud cover
-Cat8. cloudy_water: lake water surface seen through thin cloud cover
-Cat9. FSI_clouds: opaque or thin cloud covered lake surface where Fmask classifies as snow/ice
-Cat10. any situation where none of the above categories can be assigned over the entire lake
+Class name|Description
+---|---
+Cat1. partial_img_cover|add a polygon of this category if Landsat image does not fully cover the lake polygon
+Cat2. snow|lake surface covered by snow
+Cat3. opaque_ice|lake surface covered by opaque ice
+Cat4. clear_ice|lake surface covered by clear ice
+Cat5. water|lake water surface
+Cat6. cloudy_opaque_ice|opaque ice cover on lakes seen through thin cloud cover
+Cat7. cloudy_clear_ice|clear ice cover on lakes seen through thin cloud cover
+Cat8. cloudy_water|lake water surface seen through thin cloud cover
+Cat9. FSI_clouds|opaque or thin cloud covered lake surface where Fmask classifies as snow/ice
+Cat10. uncertain|any situation where none of the above categories can be assigned over the entire lake
 
 ## Examples
-
-Cat1. 
