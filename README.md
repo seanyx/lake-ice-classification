@@ -2,7 +2,7 @@
 Google Earth Engine interface to aid building training data for classifying ice formation on lake surfaces
 
 ## Setup the script
-1. Open [this](https://code.earthengine.google.com/b7499cdc58b6d76ffb60d1a49a6bd083) GEE script in a new tab, and save the script to your own GEE repository;
+1. Open [this](https://code.earthengine.google.com/b9bbc0b73fd128c2bed66b75d646700d) GEE script in a new tab, and save the script to your own GEE repository;
 2. run the script, and when the interface appears on the map, click on the "next" button to go to the first lake, or enter the lake index directly in the textbox to the right of the "next" button;
 3. save frequently, and when you're done for the day, save the script first then export the data by running the script and initiate the task.
 
