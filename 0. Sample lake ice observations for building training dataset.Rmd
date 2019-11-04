@@ -1,0 +1,69 @@
+---
+title: "sample lake ice observations for building training dataset"
+author: "Xiao Yang"
+date: "8/1/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(tidyverse)
+require(sf)
+
+load("~/Google_Drive/Global_lake_ice_dataset/outputs/model_input.RData", verbose = T)
+```
+
+```{r}
+aside = function(x, FUN) {
+  print(FUN(x))
+  return(x)
+}
+
+model_input %>% 
+  sample_frac(0.01) %>% 
+  # aside() %>% 
+  ggplot() +
+  geom_hex(aes(x = temp, y = n_ice / n_clear, fill = log(..count..))) +
+  scale_fill_viridis_c() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = "ERA5 30-day prior mean SAT (ºC)",
+    y = "Lake ice fraction"
+  )
+
+require(splitstackshape)
+set.seed(seed = 2019)
+samples = model_input %>% 
+  mutate(lif = n_ice / n_clear) %>% 
+  filter(lif >= 0.15, lif <=0.85) %>% 
+  mutate(temp_grp = cut(temp, breaks = seq(-48, 36, length = 11), include.lowest = T)) %>% 
+  group_by(temp_grp) %>% 
+  sample_n(100, replace = T) %>% 
+  ungroup()
+
+samples %>% select(LANDSAT_SCENE_ID) %>% distinct
+samples %>% select(Hylak_id) %>% distinct
+
+samples %>% 
+  ggplot() +
+  geom_histogram(aes(x = Lake_area), bins = 30) +
+  scale_x_log10()
+
+set.seed(2019)
+subsamples = samples %>% 
+  group_by(Hylak_id) %>% 
+  sample_n(1) %>% 
+  ungroup
+
+subsamples %>% 
+  ggplot() +
+  geom_histogram(aes(x = Lake_area), bins = 30) +
+  scale_x_log10()
+
+subsamples %>% select(LANDSAT_SCENE_ID) %>% distinct %>% nrow()
+subsamples %>% select(Hylak_id) %>% distinct %>% nrow()
+
+write_csv(subsamples, path = "outputs/subsamples_training_lakes_20190802.csv")
+```
+
