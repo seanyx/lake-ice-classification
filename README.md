@@ -5,5 +5,4 @@
 
 ## Downlaod manually drawn classification polygons and set up training dataset
 ("0. Set up training dataset.Rmd")
-
-## 
+("GEE: export_pixel_values_training.js")
