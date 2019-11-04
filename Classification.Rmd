@@ -1,0 +1,51 @@
+---
+title: "Classification"
+author: "Xiao Yang"
+date: "8/22/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+require(tidyverse)
+require(rpart)
+```
+
+```{r}
+dat = read_csv("data/lake_ice_training_data_2019_08_22.csv") %>% 
+  select(-`system:index`, -`.geo`) %>% 
+  mutate(SENSOR_ID = as.factor(SENSOR_ID))
+  # mutate(scl_int = factor(scl_int, levels = 1:4, labels = c("Thin ice", "Cloud", "Opaque ice/snow", "Water")))
+
+
+fit = rpart(scl_int ~ Swir1 + Blue + Red + Green + hue + Blue_diss + Red_diss + SENSOR_ID, method = "class", data = dat)
+
+printcp(fit) # display the results 
+plotcp(fit) # visualize cross-validation results 
+summary(fit) # detailed summary of splits
+
+# create additional plots 
+# par(mfrow=c(1,2)) # two plots on one page 
+rsq.rpart(fit) # visualize cross-validation results   
+
+# plot tree 
+plot(fit, uniform=F, branch = 0, compress = T,
+   main="Classification Tree for lake surface types")
+text(fit, use.n=TRUE, cex=.8, all = F)
+
+## confusion matrix
+
+```
+
+## example of using R tree in GEE
+https://code.earthengine.google.com/af98af92f61b76874d55b680e0382831
+
+## lab
+
+```{r}
+require(party)
+
+fit_ctree = ctree(scl_int ~ ., data = dat)
+# plot(fit_ctree, main="Conditional Inference Tree for lake surface types")
+
+```
+
