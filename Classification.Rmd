@@ -11,13 +11,39 @@ require(rpart)
 ```
 
 ```{r}
-dat = read_csv("data/lake_ice_training_data_2019_08_22.csv") %>% 
-  select(-`system:index`, -`.geo`) %>% 
-  mutate(SENSOR_ID = as.factor(SENSOR_ID))
+dat = read_csv("data/outputTraining_11042019.csv") %>% 
+  select(-`system:index`)
   # mutate(scl_int = factor(scl_int, levels = 1:4, labels = c("Thin ice", "Cloud", "Opaque ice/snow", "Water")))
 
+dat %>% select(class) %>% distinct()
 
-fit = rpart(scl_int ~ Swir1 + Blue + Red + Green + hue + Blue_diss + Red_diss + SENSOR_ID, method = "class", data = dat)
+target_classes = c("opaque_ice", "clear_ice", "FSI_clouds", "water", "snow")
+
+datfil = dat %>% 
+  filter(class %in% target_classes) %>% 
+  filter(fmask != 0) %>% 
+  mutate(class_factor = factor(class, levels = target_classes, labels = c("Opaque Ice", "Clear Ice", "Cloud", "Water", "Snow")),
+         class_factor_sim = factor(class, levels = target_classes, labels = c("Snow/Ice", "Snow/Ice", "Cloud", "Water", "Snow/Ice")),
+         fmask_factor = factor(fmask, levels = c(3, 2, 4, 1), labels = c("Snow/Ice", "Cloud", "Cloud", "Water")),
+         sensor_id = factor(substr(LANDSAT, start = 3, stop = 3), levels = c("5", "7", "8"), labels = c("TM", "ETM+", "OLI")))
+  # filter(sensor_id == "TM")
+
+datfil %>% ggplot() + geom_boxplot(aes(x = class_factor, y = Nir_stdDev))
+datfil %>% ggplot() + geom_boxplot(aes(x = class_factor_sim, y = Swir1))
+datfil %>% ggplot() + geom_boxplot(aes(x = class_factor_sim, y = Blue_log10_grad))
+
+
+fit = rpart(class_factor_sim ~ Blue + Red + Green + Nir + Swir1 + Swir2 + Nir_stdDev + Blue_stdDev + Nir_log10_grad + Blue_log10_grad + WICI + hue + saturation + value + sensor_id, method = "class", data = datfil)
+
+fitf = randomForest(class_factor_sim ~ Blue + Red + Green + Nir + Swir1 + Swir2 + Nir_stdDev + Blue_stdDev + Nir_log10_grad + Blue_log10_grad + WICI + hue + saturation + value + sensor_id, data = datfil)
+
+varImpPlot(fitf, type = 2)
+importance(fitf, type = 1)
+
+# plot tree 
+plot(fit, uniform=F, branch = 0, compress = F,
+   main="Classification Tree for lake surface types")
+text(fit, use.n=TRUE, cex=.8, all = F)
 
 printcp(fit) # display the results 
 plotcp(fit) # visualize cross-validation results 
@@ -27,13 +53,22 @@ summary(fit) # detailed summary of splits
 # par(mfrow=c(1,2)) # two plots on one page 
 rsq.rpart(fit) # visualize cross-validation results   
 
-# plot tree 
-plot(fit, uniform=F, branch = 0, compress = T,
-   main="Classification Tree for lake surface types")
-text(fit, use.n=TRUE, cex=.8, all = F)
+
+datfil %>% 
+  filter(Swir1 < 0.0929) %>% 
+  ggplot() +
+  geom_point(aes(x = Blue, y = Blue_log10_grad, color = class_factor_sim), alpha = 0.3, size = 0.2) +
+  facet_wrap(~class_factor_sim)
 
 ## confusion matrix
+predicted_sim_class = predict(fit, newdata = datfil, type = "class")
+reference_sim_class = datfil$class_factor_sim
 
+caret::confusionMatrix(data = predicted_sim_class, reference = reference_sim_class)
+
+fmask_sim_class = datfil$fmask_factor
+
+caret::confusionMatrix(data = fmask_sim_class, reference = reference_sim_class)
 ```
 
 ## example of using R tree in GEE
