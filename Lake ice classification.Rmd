@@ -1,0 +1,300 @@
+---
+title: "Classification"
+author: "Xiao Yang"
+date: "3/2/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(sf)
+require(tidyverse)
+
+dat = st_read("data/lake_ice_training_dataset_03062020_d235c1fe75b64e58b844df19d6aee252.shp") %>% 
+  filter(class %in% c("clear_ice", "opaque_ice", "snow", "water"))
+
+dat = dat %>% 
+  dplyr::rename(toaId = LANDSAT_SC,
+         srId = productIdS) %>% 
+  mutate(lon = st_coordinates(geometry)[, 1],
+         lat = st_coordinates(geometry)[, 2]) %>% 
+  st_drop_geometry() %>% 
+  as_tibble()
+
+dat = dat %>% 
+  filter(source == "SR") %>% 
+  mutate(BT1 = BT1 / 10,
+         BT2 = BT2 / 10) %>% 
+  bind_rows(dat %>% 
+  filter(source == "TOA"))
+
+dat = dat %>% 
+  filter(BT1 >= 200 & BT1 <= 340,
+         BT2 >= 200 & BT2 <= 340)
+
+dat = dat %>% 
+  gather(key = "predictor", value = "value", -c(nTOA, nSR, source, Hylak_id, srId, toaId, class, lon, lat, fmask))
+
+dat = dat %>% 
+  filter(predictor %in% c("BT1", "BT2")) %>% 
+  bind_rows(dat %>% 
+              filter(!(predictor %in% c("BT1", "BT2"))) %>% 
+              filter(value >= 0 & value <= 1))
+  
+dat = dat %>% 
+  mutate(Landsat = as.factor(substr(toaId, start = 3, stop = 3))) %>% 
+  mutate(
+    class = factor(class, levels = c("clear_ice", "opaque_ice", "snow", "water"), labels = c("Clear ice", "Opaque ice", "Snow", "Water")),
+    class_sim = factor(class != "Water", levels = c(TRUE, FALSE), labels = c("Ice", "Water"))
+    )
+```
+
+## boxplots
+
+```{r}
+require(patchwork)
+
+p_ref_all_class = dat %>% 
+  filter(predictor %in% c("Blue", "Green", "Red", "Nir", "Swir1", "Swir2")) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = predictor, y = value, fill = class), position = position_dodge(width = 0.75)) +
+  facet_wrap(~source, scales = "free_y") + 
+  labs(x = "Predictors",
+       y = "Reflectance values",
+       fill = "Class")
+
+p_ref_2_class = dat %>% 
+  filter(predictor %in% c("Blue", "Green", "Red", "Nir", "Swir1", "Swir2")) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = predictor, y = value, fill = class_sim), position = position_dodge(width = 0.75)) +
+  facet_wrap(~source, scales = "free_y") + 
+  labs(x = "Predictors",
+       y = "Reflectance values",
+       fill = "Class")
+
+p_texture_all_class = dat %>% 
+  filter(predictor %in% c("Blue_diss", "Green_diss", "Red_diss")) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = predictor, y = value, fill = class)) +
+  scale_y_log10() +
+  facet_wrap(~source, scales = "free_y", ncol = 2) + 
+  labs(x = "Predictors",
+       y = "Texture values",
+       fill = "Class")
+
+p_texture_2_class = dat %>% 
+  filter(predictor %in% c("Blue_diss", "Green_diss", "Red_diss")) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = predictor, y = value, fill = class_sim)) +
+  scale_y_log10() +
+  facet_wrap(~source, scales = "free_y", ncol = 2) + 
+  labs(x = "Predictors",
+       y = "Texture values",
+       fill = "Class")
+
+merged1 = (p_ref_all_class / p_texture_all_class) +
+  plot_annotation(title = "Boxplot of predictors",
+                  tag_levels = "A")
+
+merged1 %>% 
+  ggsave(filename = "figs/predictors_boxplot_all_class.png",
+         width = 8,
+         height = 6,
+         dpi = 300)
+
+merged2 = (p_ref_2_class / p_texture_2_class) +
+  plot_annotation(title = "Boxplot of predictors",
+                  tag_levels = "A")
+
+merged2 %>% 
+  ggsave(filename = "figs/predictors_boxplot_2_class.png",
+         width = 8,
+         height = 6,
+         dpi = 300)
+```
+
+## convert to wide format for modeling
+
+```{r}
+dat_wide = dat %>% 
+  spread(key = predictor, value = value) %>% 
+  drop_na()
+```
+
+
+## PCA analysis
+
+```{r}
+require(ggbiplot)
+
+dat %>% 
+  ggplot() +
+  geom_density(aes(x = value, fill = predictor), alpha = 0.3) +
+  facet_wrap(~source)
+
+landsat = "7"
+
+dat_wide_satellite = dat_wide %>% 
+  filter(Landsat == landsat)
+
+dat_wide_sr = dat_wide_satellite %>% filter(source == "SR")
+dat_wide_toa = dat_wide_satellite %>% filter(source == "TOA")
+
+corrplot::corrplot(cor(dat_wide_sr[11:19]), method = "ellipse")
+corrplot::corrplot(cor(dat_wide_toa[11:19]), method = "ellipse")
+
+dat_pca_sr = prcomp(dat_wide_sr[, 11:19], center = T, scale. = T)
+
+dat_pca_toa = prcomp(dat_wide_toa[, 11:19], center = T, scale. = T)
+
+biplot_sr = ggbiplot(dat_pca_sr, alpha = 0.1, pch = "o", size = 0.1, groups = dat_wide_sr$class, ellipse = T, varname.adjust = 2.5) +
+  labs(title = paste("Landsat", landsat, "SR"), color = "Classes") +
+  coord_cartesian(xlim = c(-5, 2), ylim = c(-5, 4))
+
+biplot_toa = ggbiplot(dat_pca_toa, alpha = 0.1, pch = "o", size = 0.1, groups = dat_wide_toa$class, ellipse = T) +
+  labs(title = paste("Landsat", landsat, "TOA"), color = "Classes") +
+  coord_cartesian(xlim = c(-5, 2), ylim = c(-5, 4))
+
+merged_plot = ggpubr::ggarrange(plotlist = list(biplot_sr, biplot_toa), common.legend = T, legend = "bottom")
+
+merged_plot %>% ggsave(
+  filename = paste0("figs/merged_pca_landsat_", landsat, ".png"),
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+## classification tree all classes
+
+```{r}
+dat_wide %>% 
+  mutate(class_int = as.integer(class)) %>% 
+  select(class, class_int) %>% 
+  distinct
+
+dat_wide_sr = (dat_wide %>% 
+  mutate(class_int = as.integer(class)) %>% 
+  filter(source == "SR"))[, c(11, 13:24)]
+
+require(rpart)
+require(rpart.plot)
+
+set.seed(2020)
+sr_rpart = rpart(class_int~., data = dat_wide_sr, method = "class")
+
+test = summary(sr_rpart)
+test$variable.importance %>% tibble(imp = ., predictors = names(.)) %>% ggplot() + geom_bar(aes(x = predictors, y = imp), stat = "identity")
+
+plotcp(sr_rpart)
+
+# find best value of cp
+min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"]
+min_cp
+
+sr_rpart_prune = prune(sr_rpart, cp = min_cp)
+
+prp(sr_rpart_prune, type = 5)
+
+sr_rpart_prune
+
+pred = predict(sr_rpart_prune, type = "class")
+table(pred)
+table(pred, dat_wide_sr$class_int)
+
+output = strsplit("node), split, n, loss, yval, (yprob)
+      * denotes terminal node
+
+ 1) root 9153 5310 4 (0.130886048 0.411122036 0.038129575 0.419862340)  
+   2) Blue>=0.17575 3763  595 2 (0.034281159 0.841881478 0.092745150 0.031092214)  
+     4) Blue< 0.6181 3441  273 2 (0.037489102 0.920662598 0.007846556 0.034001744)  
+       8) Swir1< 0.1097 3329  161 2 (0.038750375 0.951637128 0.008110544 0.001501953) *
+       9) Swir1>=0.1097 112    0 4 (0.000000000 0.000000000 0.000000000 1.000000000) *
+     5) Blue>=0.6181 322    0 3 (0.000000000 0.000000000 1.000000000 0.000000000) *
+   3) Blue< 0.17575 5390 1664 4 (0.198330241 0.110389610 0.000000000 0.691280148)  
+     6) BT2< 273.05 2637 1509 4 (0.389836936 0.182404247 0.000000000 0.427758817)  
+      12) Blue>=0.09955 1399  627 1 (0.551822731 0.340957827 0.000000000 0.107219442)  
+        24) Swir1< 0.0533 1279  507 1 (0.603596560 0.372947615 0.000000000 0.023455825)  
+          48) BT1< 271.05 605  104 1 (0.828099174 0.127272727 0.000000000 0.044628099)  
+            96) BT1>=264.8 522   29 1 (0.944444444 0.011494253 0.000000000 0.044061303) *
+            97) BT1< 264.8 83   12 2 (0.096385542 0.855421687 0.000000000 0.048192771) *
+          49) BT1>=271.05 674  274 2 (0.402077151 0.593471810 0.000000000 0.004451039)  
+            98) Red_diss< 0.4112103 154   17 1 (0.889610390 0.110389610 0.000000000 0.000000000) *
+            99) Red_diss>=0.4112103 520  137 2 (0.257692308 0.736538462 0.000000000 0.005769231) *
+        25) Swir1>=0.0533 120    0 4 (0.000000000 0.000000000 0.000000000 1.000000000) *
+      13) Blue< 0.09955 1238  260 4 (0.206785137 0.003231018 0.000000000 0.789983845)  
+        26) Blue_diss>=0.6195437 151   28 1 (0.814569536 0.006622517 0.000000000 0.178807947) *
+        27) Blue_diss< 0.6195437 1087  136 4 (0.122355106 0.002759890 0.000000000 0.874885005) *
+     7) BT2>=273.05 2753  155 4 (0.014892844 0.041409372 0.000000000 0.943697784) *", split = "\n")[[1]]
+
+output %>% 
+  paste(collapse = "\n")
+```
+
+## performance
+
+```{r}
+dat_wide_sr = (dat_wide %>% 
+  mutate(class_int = as.integer(class)) %>% 
+  filter(source == "SR"))[, c(5, 8, 11, 13:23)]
+
+require(rpart)
+require(rpart.plot)
+
+validation = dat_wide_sr %>% 
+  group_by(Hylak_id, Landsat) %>% 
+  do({
+    dat = . 
+    
+    this_training = dat_wide_sr %>% 
+      filter(Hylak_id != dat$Hylak_id[1],
+             Landsat == dat$Landsat[1]) %>% 
+      select(-Hylak_id, -Landsat)
+    
+    set.seed(2020)
+    
+    sr_rpart = rpart(class~., data = this_training, method = "class")
+    min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"]
+    sr_rpart_prune = prune(sr_rpart, cp = min_cp)
+    pred_nw = predict(sr_rpart_prune, newdata = dat, type = "class")
+    
+    sr_rpart = rpart(class~., data = this_training, method = "class", weights = 1 + 1 * (this_training$class == "Water"))
+    min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"]
+    sr_rpart_prune = prune(sr_rpart, cp = min_cp)
+    pred_1w = predict(sr_rpart_prune, newdata = dat, type = "class")
+    
+    sr_rpart = rpart(class~., data = this_training, method = "class", weights = 1 + 3 * (this_training$class == "Water"))
+    min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"]
+    sr_rpart_prune = prune(sr_rpart, cp = min_cp)
+    pred_2w = predict(sr_rpart_prune, newdata = dat, type = "class")
+    
+    dat %>% bind_cols(tibble(pred_nw, pred_1w, pred_2w))
+
+  }) %>% 
+  ungroup()
+
+validation_fig = validation %>% 
+  gather(key = "model", value = "pred", c(pred_nw, pred_1w, pred_2w)) %>% 
+  ggplot() +
+  geom_bar(aes(x = class, fill = pred), position = "fill") +
+  facet_grid(model~Landsat) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Reference class",
+    y = "",
+    fill = "Predicted class"
+  ) +
+  scale_fill_manual(values = c("lightblue", "darkgrey", "white", "darkblue"))
+
+validation_fig
+
+validation_fig %>% 
+  ggsave(
+    filename = "figs/validation_fig_water_var_weight.png",
+    width = 8,
+    height = 8,
+    dpi = 300
+  )
+```
+
