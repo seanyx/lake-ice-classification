@@ -176,13 +176,13 @@ dat_wide %>%
 
 dat_wide_sr = (dat_wide %>% 
   mutate(class_int = as.integer(class)) %>% 
-  filter(source == "SR"))[, c(11, 13:24)]
+  filter(source == "SR"))[, c(1, 11, 13:24)]
 
 require(rpart)
 require(rpart.plot)
 
 set.seed(2020)
-sr_rpart = rpart(class_int~., data = dat_wide_sr, method = "class")
+sr_rpart = rpart(class_int~., data = dat_wide_sr %>% select(-fmask), method = "class")
 
 test = summary(sr_rpart)
 test$variable.importance %>% tibble(imp = ., predictors = names(.)) %>% ggplot() + geom_bar(aes(x = predictors, y = imp), stat = "identity")
@@ -197,12 +197,23 @@ sr_rpart_prune = prune(sr_rpart, cp = min_cp)
 
 prp(sr_rpart_prune, type = 5)
 
-sr_rpart_prune
+
 
 pred = predict(sr_rpart_prune, type = "class")
 table(pred)
 table(pred, dat_wide_sr$class_int)
 
+validation = dat_wide_sr %>% bind_cols(pred = pred)
+
+validation %>%
+  # bind_cols(dat_wide %>% select(fmask)) %>% 
+  ggplot() +
+  geom_bar(aes(fmask, fill = pred)) +
+  scale_fill_manual(values = c("lightblue", "darkgrey", "white", "darkblue"))
+
+
+## export the tree
+sr_rpart_prune
 output = strsplit("node), split, n, loss, yval, (yprob)
       * denotes terminal node
 
@@ -237,7 +248,7 @@ output %>%
 ```{r}
 dat_wide_sr = (dat_wide %>% 
   mutate(class_int = as.integer(class)) %>% 
-  filter(source == "SR"))[, c(5, 8, 11, 13:23)]
+  filter(source == "SR"))[, c(1, 5, 8, 11, 13:23)]
 
 require(rpart)
 require(rpart.plot)
@@ -250,7 +261,7 @@ validation = dat_wide_sr %>%
     this_training = dat_wide_sr %>% 
       filter(Hylak_id != dat$Hylak_id[1],
              Landsat == dat$Landsat[1]) %>% 
-      select(-Hylak_id, -Landsat)
+      select(-Hylak_id, -Landsat, -fmask)
     
     set.seed(2020)
     
@@ -274,6 +285,8 @@ validation = dat_wide_sr %>%
   }) %>% 
   ungroup()
 
+save(validation, file = "outputs/validation.RData")
+
 validation_fig = validation %>% 
   gather(key = "model", value = "pred", c(pred_nw, pred_1w, pred_2w)) %>% 
   ggplot() +
@@ -296,5 +309,10 @@ validation_fig %>%
     height = 8,
     dpi = 300
   )
+
+validation %>% 
+  ggplot() +
+  geom_bar(aes(fmask, fill = pred_nw)) +
+  scale_fill_manual(values = c("lightblue", "darkgrey", "white", "darkblue"))
 ```
 
