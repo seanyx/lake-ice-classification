@@ -5,14 +5,34 @@ date: "3/2/2020"
 output: html_document
 ---
 
+
+## To dos
+* test removing both snow and cloud classes
+* test removing Land class
+* prioritize distinguishing (snow, ice, clear ice)/water
+* robust model testing using leave sensor and lake out approach (visualize by relative error and size of tree parameter)
+* validate against in situ record
+
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
 require(sf)
 require(tidyverse)
 
-dat = st_read("data/lake_ice_training_dataset_03062020_d235c1fe75b64e58b844df19d6aee252.shp") %>% 
-  filter(class %in% c("clear_ice", "opaque_ice", "snow", "water"))
+calculate_map_bounds = function(minlat, maxlat, minlon, maxlon, crs) {
+  line1 = st_linestring(x = matrix(c(minlon, minlat, maxlon, maxlat), byrow = T, nrow = 2), dim = "XY")
+  line2 = st_linestring(x = matrix(c(minlon, maxlat, maxlon, minlat), byrow = T, nrow = 2), dim = "XY")
+  output = st_as_sfc(list(line1, line2), crs = 4326) %>% st_transform(crs) %>% st_bbox()
+  
+  return(output)
+}
+
+dat = st_read("data/lake_ice_training_dataset_03102020_5c8d0495db475dede5e4429b6d14da81.shp")
+
+dat = dat %>% 
+  filter(!(class %in% c("bad_image", "uncertain"))) %>% 
+  na.omit()
 
 dat = dat %>% 
   dplyr::rename(toaId = LANDSAT_SC,
@@ -23,15 +43,8 @@ dat = dat %>%
   as_tibble()
 
 dat = dat %>% 
-  filter(source == "SR") %>% 
-  mutate(BT1 = BT1 / 10,
-         BT2 = BT2 / 10) %>% 
-  bind_rows(dat %>% 
-  filter(source == "TOA"))
-
-dat = dat %>% 
-  filter(BT1 >= 200 & BT1 <= 340,
-         BT2 >= 200 & BT2 <= 340)
+  filter(BT1 <= 350,
+         BT2 <= 350)
 
 dat = dat %>% 
   gather(key = "predictor", value = "value", -c(nTOA, nSR, source, Hylak_id, srId, toaId, class, lon, lat, fmask))
@@ -45,9 +58,77 @@ dat = dat %>%
 dat = dat %>% 
   mutate(Landsat = as.factor(substr(toaId, start = 3, stop = 3))) %>% 
   mutate(
-    class = factor(class, levels = c("clear_ice", "opaque_ice", "snow", "water"), labels = c("Clear ice", "Opaque ice", "Snow", "Water")),
-    class_sim = factor(class != "Water", levels = c(TRUE, FALSE), labels = c("Ice", "Water"))
-    )
+    class_new = factor(class, levels = c("clear_ice", "opaque_ice", "snow", "water", "land", "FSI_clouds"), labels = c("Clear ice", "Opaque ice", "Snow", "Water", "Land", "Cloud")),
+    class_sim = factor(class, levels = c("clear_ice", "opaque_ice", "snow", "water", "land", "FSI_clouds"), labels = c("Ice", "Ice", "Ice", "Water", "Land", "Cloud"))
+    ) %>% 
+  select(-class) %>% 
+  rename(class = class_new) %>% 
+  select(-nTOA, -nSR)
+
+save(dat, file = "outputs/03102020_training_data.RData")
+```
+
+## statistics
+
+```{r}
+load("outputs/03102020_training_data.RData", verbose = T)
+summary(dat)
+require(patchwork)
+
+p1 = dat %>% 
+  ggplot +
+  geom_bar(aes(x = class, fill = Landsat)) +
+  labs(
+    x = "Class",
+    y = "Record count"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 = dat %>% 
+  group_by(class, Landsat) %>% 
+  summarise(nlakes = length(Hylak_id %>% unique)) %>% 
+  ungroup() %>% 
+  ggplot() +
+  geom_bar(aes(x = class, y = nlakes, fill = Landsat), stat = "identity") +
+  labs(
+    x = "Class",
+    y = "Lake count"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+xylim = calculate_map_bounds(minlat = -55, maxlat = 80, minlon = -180, maxlon = 180, crs = 54030)
+xymin = xylim[1:2]
+xymax = xylim[3:4]
+world = rnaturalearthdata::countries50 %>% st_as_sf %>% 
+  st_transform(crs = 54030)
+
+map = lake_stats %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% 
+  st_transform(crs = 54030) %>% 
+  ggplot() +
+  geom_sf(data = world, fill = "black", color = NA) +
+  geom_sf(aes(size = nclass, color = class_mode), alpha = 0.5) +
+  scale_size_continuous(breaks = 1:3, range = c(1, 3)) +
+  coord_sf(crs = st_crs(54030), 
+           xlim = c(xymin[1], xymax[1]), 
+           ylim = c(xymin[2], xymax[2]),
+           expand = T) +
+  labs(color = "Mode(class)",
+       size = "Number of classes")
+
+merged = (p1 + p2) + plot_layout(guides = "collect", tag_level = "new") - map + plot_layout(ncol = 1, widths = 5, heights = 10, tag_level = "keep") +
+  plot_annotation(title = "Distributions of the lakes in the training data",
+                  tag_levels = c("A", '1'),
+                  theme = theme())
+
+merged %>% 
+  ggsave(
+    filename = "figs/Distributions of the lakes in the training data.png",
+    width = 8,
+    height = 8,
+    dpi = 300
+  )
 ```
 
 ## boxplots
@@ -125,6 +206,8 @@ dat_wide = dat %>%
 
 ## PCA analysis
 
+https://www.datacamp.com/community/tutorials/pca-analysis-r
+
 ```{r}
 require(ggbiplot)
 
@@ -169,150 +252,938 @@ merged_plot %>% ggsave(
 ## classification tree all classes
 
 ```{r}
-dat_wide %>% 
+class_color = tibble(
+  class = c("Clear ice", "Opaque ice", "Snow", "Water", "Land", "Cloud"),
+  color = c('#6baed6', 'cyan', 'white', 'blue', 'orange', 'grey')
+)
+
+join_table = dat_wide %>% 
   mutate(class_int = as.integer(class)) %>% 
   select(class, class_int) %>% 
-  distinct
+  distinct %>% 
+  arrange(class_int) %>% 
+  inner_join(class_color)
+
+join_table
 
 dat_wide_sr = (dat_wide %>% 
   mutate(class_int = as.integer(class)) %>% 
-  filter(source == "SR"))[, c(1, 11, 13:24)]
+  filter(source == "SR"))[, c(1, 8:9, 11:21)]
+
+
+### train classifier
+require(rpart)
+require(rpart.plot)
+
+set.seed(2020)
+sr_rpart = rpart(class ~ ., data = dat_wide_sr %>% select(-fmask), method = "class", model = T)
+
+sr_rpart$variable.importance %>% tibble(imp = ., predictors = names(.)) %>% ggplot() + geom_bar(aes(x = predictors, y = imp), stat = "identity")
+
+# find best value of cp to prune
+plotcp(sr_rpart)
+min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"]
+min_cp
+sr_rpart_prune = prune(sr_rpart, cp = min_cp)
+
+## visualize the tree
+png(filename = "figs/tree_CP_001.png", width = 6, height = 6, units = "in", antialias = "default", res = 300)
+prp(sr_rpart_prune, type = 5)
+dev.off()
+
+
+
+## confusion matrix
+pred = predict(sr_rpart_prune, type = "class")
+table(pred)
+table(pred, dat_wide_sr$class)
+
+validation = dat_wide_sr %>% 
+  bind_cols(pred = as.character(pred)) %>% 
+  mutate(fmask = factor(fmask, levels = 0:4, labels = c("Clear", "Water", "Cloud Shadow", "Snow/Ice", "Cloud"))) %>% 
+  inner_join(join_table, by = c("pred" = "class"))
+
+v1n = validation %>%
+  ggplot() +
+  geom_bar(aes(class, fill = pred)) +
+  scale_fill_manual(values = join_table %>% arrange(class) %>% pull(color)) +
+  labs(
+    x = "Manually identified class",
+    y = "Count",
+    fill = "Predicted"
+  ) +
+  facet_wrap(~Landsat) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+v1p = validation %>%
+  ggplot() +
+  geom_bar(aes(class, fill = pred), position = "fill") +
+  scale_fill_manual(values = join_table %>% arrange(class) %>% pull(color)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Manually identified class",
+    y = "Percent",
+    fill = "Predicted"
+  ) +
+  facet_wrap(~Landsat) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+merged_error_training = v1n + v1p + plot_layout(ncol = 1, guides = "collect") +
+  plot_annotation(title = "Validation on training data")
+
+merged_error_training
+
+merged_error_training %>% 
+  ggsave(filename = "figs/merged_error_training.png",
+         width = 8,
+         height = 8,
+         dpi = 300)
+
+v2fmask = validation %>%
+  ggplot() +
+  geom_bar(aes(class, fill = fmask)) +
+  scale_fill_manual(values = c("orange", "blue", "grey", "cyan", "white")) +
+  labs(x = "Manually identified class",
+       y = "Count",
+       fill = "Fmask")
+
+v2fmask
+```
+
+## classification tree all classes (iteratively determine cp)
+
+```{r}
+class_color = tibble(
+  class = c("Clear ice", "Opaque ice", "Snow", "Water", "Land", "Cloud"),
+  color = c('#6baed6', 'cyan', 'white', 'blue', 'orange', 'grey')
+)
+
+join_table = dat_wide %>% 
+  mutate(class_int = as.integer(class)) %>% 
+  select(class, class_int) %>% 
+  distinct %>% 
+  arrange(class_int) %>% 
+  inner_join(class_color)
+
+join_table
+
+dat_wide_sr = (dat_wide %>% 
+                 filter(!(fmask %in% c(2, 4))) %>% 
+  mutate(class_int = as.integer(class)) %>% 
+  # filter(Landsat == "5") %>%
+  filter(source == "SR",
+         Landsat != "7",
+         !(class %in% c("Snow", "Cloud", "Land"))))[, c(1, 3, 8:9, 11:21)]
+
+dat_wide_sr %>% select(class) %>% distinct()
+
+
+### train classifier
+require(rpart)
+require(rpart.plot)
+
+# set.seed(2020)
+
+all_lakes_ids = dat_wide_sr %>% 
+  select(Hylak_id) %>% 
+  distinct() %>% 
+  pull(Hylak_id)
+
+N = length(all_lakes_ids)
+nv = (N * 0.3) %>% as.integer()
+nte = ((N - nv) * 0.3) %>% as.integer()
+ntr = N - nv - nte
+
+for (i in 1:50) {
+  print(paste(i, "iteration"))
+  ids = c(rep("validation", nv), rep("testing", nte), rep("training", ntr)) %>% sample(size = N, replace = F)
+  
+  all_lakes = dat_wide_sr %>% 
+    select(Hylak_id) %>% 
+    distinct() %>% 
+    bind_cols(tibble(type = ids))
+  
+  validation = dat_wide_sr %>% right_join(all_lakes %>% filter(type == "validation") %>% select(-type), by = "Hylak_id") %>% select(-fmask, -Hylak_id)
+  testing = dat_wide_sr %>% right_join(all_lakes %>% filter(type == "testing") %>% select(-type), by = "Hylak_id") %>% select(-fmask, -Hylak_id)
+  training = dat_wide_sr %>% right_join(all_lakes %>% filter(type == "training") %>% select(-type), by = "Hylak_id") %>% select(-fmask, -Hylak_id)
+  
+  this_sr_rpart = rpart(class ~ ., data = training, method = "class", model = T, control = rpart.control(cp = 0.0001))
+  
+  imp = tibble(
+    predictors = names(this_sr_rpart$variable.importance),
+    imp_rank = 1:length(this_sr_rpart$variable.importance))
+  
+  this_run = tibble(cp = seq(0.00001, 0.1, length = 50)) %>% 
+    group_by(cp) %>% 
+    do({
+      dat = .
+      
+      sr_rpart_prune = prune(this_sr_rpart, cp = dat$cp[1])
+      
+      training %>% 
+        select(Landsat, class) %>% 
+        bind_cols(tibble(pred = predict(sr_rpart_prune, newdata = training, type = "class"))) %>% 
+        mutate(type = "training") %>% 
+        bind_rows(
+          testing %>% 
+            select(Landsat, class) %>% 
+            bind_cols(tibble(pred = predict(sr_rpart_prune, newdata = testing, type = "class"))) %>% 
+            mutate(type = "testing"))
+    }) %>% 
+    ungroup()
+  
+  this_run = this_run %>% 
+    mutate(class_sim = factor(class == "Water", levels = c(T, F), labels = c("Water", "Ice")),
+           pred_sim = factor(pred == "Water", levels = c(T, F), labels = c("Water", "Ice"))) %>% 
+    group_by(cp, type, Landsat) %>% 
+    summarise(
+      accuracy = sum(class_sim == pred_sim) / n(),
+      tp = sum((class_sim == "Ice" & pred_sim == "Ice")),
+      fp = sum((class_sim == "Water" & pred_sim == "Ice")),
+      tn = sum((class_sim == "Water" & pred_sim == "Water")),
+      fn = sum((class_sim == "Ice" & pred_sim == "Water")),
+      recall_ice = tp / (tp + fn),
+      precision_ice = tp / (tp + fp),
+      F1_ice = 2 * (precision_ice * recall_ice) / (precision_ice + recall_ice),
+      tpr = tp / (tp + fn),
+      fpr = fp / (fp + tn),
+      FOR = fn / (fn + tn)
+              ) %>% 
+    ungroup() %>% 
+    mutate(run_index = i)
+  
+  if (i == 1) {
+    output = this_run
+    imp_output = imp
+  } else if (i != 1) {
+    output = bind_rows(output, this_run)
+    imp_output = bind_rows(imp_output, imp)
+  }
+}
+
+save(output, imp_output, file = "outputs/testing_results_ls5only_fmaskCloudExcluded.RData")
+
+load("outputs/testing_results_ls5only.RData", verbose = T)
+
+testing_result = output %>% 
+  filter(type == "testing") %>%
+  select(-tp, -fp, -tn, -fn) %>% 
+  gather(key = "Metric", value = "Value", c(accuracy, recall_ice, precision_ice, F1_ice, FOR)) %>% 
+  group_by(cp, Metric) %>% 
+  summarise(metric_mean = mean(Value, na.rm = T),
+            metric_75 = quantile(Value, probs = 0.75),
+            metric_25 = quantile(Value, probs = 0.25)) %>% 
+  ungroup() %>% 
+  mutate(Metric = factor(Metric, levels = c("accuracy", "F1_ice", "precision_ice", "recall_ice", "FOR"), labels = c("Accuracy", "F1 (ice)", "Precision (ice)", "Recall (ice)", "False omission rate"))) %>% 
+  ggplot() +
+  # geom_point(aes(x = cp, y = Value), alpha = 0.3, size = 0.2) +
+  # geom_smooth(aes(x = cp, y = Value, color = Metric), se = T) +
+  geom_errorbar(aes(ymin = metric_25, ymax = metric_75, x = cp), color = "grey") +
+  geom_point(aes(x = cp, y = metric_mean)) +
+  scale_y_continuous(labels = scales::percent_format(1)) +
+  facet_wrap(~Metric, scales = "free_y") +
+  labs(
+    x = "Complexity parameter (cp)",
+    y = "",
+    color = "Metric"
+  )
+
+testing_result
+
+testing_result %>% 
+  ggsave(
+    filename = "figs/testing_result_ls5only_fmaskCloudExcluded.png",
+    width = 8,
+    height = 8,
+    dpi = 300
+  )
+```
+
+## build the final model and validate
+
+```{r}
+ids = c(rep("validation", nv), rep("testing", nte), rep("training", ntr)) %>% sample(size = N, replace = F)
+
+all_lakes = dat_wide_sr %>% 
+  select(Hylak_id) %>% 
+  distinct() %>% 
+  bind_cols(tibble(type = ids))
+
+validation = dat_wide_sr %>% right_join(all_lakes %>% filter(type == "validation") %>% select(-type), by = "Hylak_id") %>% select(-fmask, -Hylak_id)
+testing = dat_wide_sr %>% right_join(all_lakes %>% filter(type == "testing") %>% select(-type), by = "Hylak_id") %>% select(-fmask, -Hylak_id)
+training = dat_wide_sr %>% right_join(all_lakes %>% filter(type == "training") %>% select(-type), by = "Hylak_id") %>% select(-fmask, -Hylak_id)
+
+
+training_final = bind_rows(testing, training)
+
+final_sr_rpart = rpart(class ~ ., data = training_final, method = "class", model = T, control = rpart.control(cp = 0.01))
+
+final_rpart_prune = prune(final_sr_rpart, cp = 0.15)  
+## visualize the tree
+# png(filename = "figs/tree_CP_001.png", width = 6, height = 6, units = "in", antialias = "default", res = 300)
+prp(final_sr_rpart, type = 5)
+prp(final_rpart_prune, type = 5)
+# dev.off()
+
+
+
+## confusion matrix
+# pred = predict(sr_rpart_prune, type = "class")
+# table(pred)
+# table(pred, dat_wide_sr$class)
+
+validation = validation %>% 
+  bind_cols(pred = predict(final_rpart_prune, type = "class", newdata = validation)) %>% 
+  mutate(fmask = factor(fmask, levels = 0:4, labels = c("Clear", "Water", "Cloud Shadow", "Snow/Ice", "Cloud"))) %>% 
+  inner_join(join_table, by = c("pred" = "class"))
+
+v1n = validation %>%
+  ggplot() +
+  geom_bar(aes(class, fill = pred)) +
+  scale_fill_manual(values = join_table %>% arrange(class) %>% pull(color)) +
+  labs(
+    x = "Manually identified class",
+    y = "Count",
+    fill = "Predicted"
+  ) +
+  facet_wrap(~Landsat) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+v1p = validation %>%
+  ggplot() +
+  geom_bar(aes(class, fill = pred), position = "fill") +
+  scale_fill_manual(values = join_table %>% arrange(class) %>% pull(color)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Manually identified class",
+    y = "Percent",
+    fill = "Predicted"
+  ) +
+  facet_wrap(~Landsat) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+merged_error_training = v1n + v1p + plot_layout(ncol = 1, guides = "collect") +
+  plot_annotation(title = "Validation on training data")
+
+merged_error_training
+
+merged_error_training %>% 
+  ggsave(filename = "figs/merged_error_training.png",
+         width = 8,
+         height = 8,
+         dpi = 300)
+
+v2fmask = validation %>%
+  ggplot() +
+  geom_bar(aes(class, fill = fmask)) +
+  scale_fill_manual(values = c("orange", "blue", "grey", "cyan", "white")) +
+  labs(x = "Manually identified class",
+       y = "Count",
+       fill = "Fmask")
+
+v2fmask
+```
+
+## tree string to GEE
+
+```{r}
+N = length(all_lakes_ids)
+nv = (N * 0.3) %>% as.integer()
+nte = ((N - nv) * 0.3) %>% as.integer()
+ntr = N - nv - nte
+
+ids = c(rep("validation", nv), rep("testing", nte), rep("training", ntr)) %>% sample(size = N, replace = F)
+
+all_lakes = dat_wide_sr %>% 
+  select(Hylak_id) %>% 
+  distinct() %>% 
+  bind_cols(tibble(type = ids))
+
+validation = dat_wide_sr %>% right_join(all_lakes %>% filter(type == "validation") %>% select(-type), by = "Hylak_id") %>% select(-fmask, -Hylak_id)
+testing = dat_wide_sr %>% right_join(all_lakes %>% filter(type == "testing") %>% select(-type), by = "Hylak_id") %>% select(-fmask, -Hylak_id)
+training = dat_wide_sr %>% right_join(all_lakes %>% filter(type == "training") %>% select(-type), by = "Hylak_id") %>% select(-fmask, -Hylak_id)
+
+
+training_final = bind_rows(testing, training) %>% 
+  mutate(class_int = as.integer(class))
+
+training_final %>% select(class, class_int) %>% distinct()
 
 require(rpart)
 require(rpart.plot)
 
 set.seed(2020)
-sr_rpart = rpart(class_int~., data = dat_wide_sr %>% select(-fmask), method = "class")
 
-test = summary(sr_rpart)
-test$variable.importance %>% tibble(imp = ., predictors = names(.)) %>% ggplot() + geom_bar(aes(x = predictors, y = imp), stat = "identity")
+sr_rpart_gee = rpart(class_int ~ ., data = training_final %>% select(-class, -Landsat), method = "class", model = T, control = rpart.control(cp = 0.001))
 
-plotcp(sr_rpart)
+# sr_rpart_prune_gee = prune(sr_rpart_gee, cp = 0.02)
 
-# find best value of cp
-min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"]
-min_cp
-
-sr_rpart_prune = prune(sr_rpart, cp = min_cp)
-
-prp(sr_rpart_prune, type = 5)
-
-
-
-pred = predict(sr_rpart_prune, type = "class")
-table(pred)
-table(pred, dat_wide_sr$class_int)
-
-validation = dat_wide_sr %>% bind_cols(pred = pred)
-
-validation %>%
-  # bind_cols(dat_wide %>% select(fmask)) %>% 
-  ggplot() +
-  geom_bar(aes(fmask, fill = pred)) +
-  scale_fill_manual(values = c("lightblue", "darkgrey", "white", "darkblue"))
-
-
+prp(sr_rpart_prune_gee, type = 5)
 ## export the tree
-sr_rpart_prune
+sr_rpart_prune_gee
+
 output = strsplit("node), split, n, loss, yval, (yprob)
       * denotes terminal node
 
- 1) root 9153 5310 4 (0.130886048 0.411122036 0.038129575 0.419862340)  
-   2) Blue>=0.17575 3763  595 2 (0.034281159 0.841881478 0.092745150 0.031092214)  
-     4) Blue< 0.6181 3441  273 2 (0.037489102 0.920662598 0.007846556 0.034001744)  
-       8) Swir1< 0.1097 3329  161 2 (0.038750375 0.951637128 0.008110544 0.001501953) *
-       9) Swir1>=0.1097 112    0 4 (0.000000000 0.000000000 0.000000000 1.000000000) *
-     5) Blue>=0.6181 322    0 3 (0.000000000 0.000000000 1.000000000 0.000000000) *
-   3) Blue< 0.17575 5390 1664 4 (0.198330241 0.110389610 0.000000000 0.691280148)  
-     6) BT2< 273.05 2637 1509 4 (0.389836936 0.182404247 0.000000000 0.427758817)  
-      12) Blue>=0.09955 1399  627 1 (0.551822731 0.340957827 0.000000000 0.107219442)  
-        24) Swir1< 0.0533 1279  507 1 (0.603596560 0.372947615 0.000000000 0.023455825)  
-          48) BT1< 271.05 605  104 1 (0.828099174 0.127272727 0.000000000 0.044628099)  
-            96) BT1>=264.8 522   29 1 (0.944444444 0.011494253 0.000000000 0.044061303) *
-            97) BT1< 264.8 83   12 2 (0.096385542 0.855421687 0.000000000 0.048192771) *
-          49) BT1>=271.05 674  274 2 (0.402077151 0.593471810 0.000000000 0.004451039)  
-            98) Red_diss< 0.4112103 154   17 1 (0.889610390 0.110389610 0.000000000 0.000000000) *
-            99) Red_diss>=0.4112103 520  137 2 (0.257692308 0.736538462 0.000000000 0.005769231) *
-        25) Swir1>=0.0533 120    0 4 (0.000000000 0.000000000 0.000000000 1.000000000) *
-      13) Blue< 0.09955 1238  260 4 (0.206785137 0.003231018 0.000000000 0.789983845)  
-        26) Blue_diss>=0.6195437 151   28 1 (0.814569536 0.006622517 0.000000000 0.178807947) *
-        27) Blue_diss< 0.6195437 1087  136 4 (0.122355106 0.002759890 0.000000000 0.874885005) *
-     7) BT2>=273.05 2753  155 4 (0.014892844 0.041409372 0.000000000 0.943697784) *", split = "\n")[[1]]
+  1) root 5635 2352 4 (0.147293700 0.270097604 0.582608696)  
+    2) Blue>=0.17575 1358   85 2 (0.059646539 0.937407953 0.002945508)  
+      4) Green< 0.2118 309   79 2 (0.255663430 0.744336570 0.000000000)  
+        8) Nir>=0.1289 106   36 1 (0.660377358 0.339622642 0.000000000)  
+         16) Nir< 0.16545 85   16 1 (0.811764706 0.188235294 0.000000000)  
+           32) BT1>=268.45 77    8 1 (0.896103896 0.103896104 0.000000000) *
+           33) BT1< 268.45 8    0 2 (0.000000000 1.000000000 0.000000000) *
+         17) Nir>=0.16545 21    1 2 (0.047619048 0.952380952 0.000000000) *
+        9) Nir< 0.1289 203    9 2 (0.044334975 0.955665025 0.000000000)  
+         18) Blue_diss< 0.04117063 9    0 1 (1.000000000 0.000000000 0.000000000) *
+         19) Blue_diss>=0.04117063 194    0 2 (0.000000000 1.000000000 0.000000000) *
+      5) Green>=0.2118 1049    6 2 (0.001906578 0.994280267 0.003813155) *
+    3) Blue< 0.17575 4277  998 4 (0.175122750 0.058218377 0.766658873)  
+      6) BT1< 276.05 1900  998 4 (0.394210526 0.131052632 0.474736842)  
+       12) Blue>=0.09955 935  374 1 (0.600000000 0.264171123 0.135828877)  
+         24) Red< 0.14965 642  138 1 (0.785046729 0.179127726 0.035825545)  
+           48) BT1< 272.65 507   53 1 (0.895463511 0.059171598 0.045364892)  
+             96) Green< 0.18195 485   31 1 (0.936082474 0.061855670 0.002061856)  
+              192) Blue_diss< 0.8392857 471   23 1 (0.951167728 0.046709130 0.002123142)  
+                384) Red< 0.14595 442   14 1 (0.968325792 0.029411765 0.002262443) *
+                385) Red>=0.14595 29    9 1 (0.689655172 0.310344828 0.000000000)  
+                  770) Blue>=0.14215 22    2 1 (0.909090909 0.090909091 0.000000000) *
+                  771) Blue< 0.14215 7    0 2 (0.000000000 1.000000000 0.000000000) *
+              193) Blue_diss>=0.8392857 14    6 2 (0.428571429 0.571428571 0.000000000) *
+             97) Green>=0.18195 22    0 4 (0.000000000 0.000000000 1.000000000) *
+           49) BT1>=272.65 135   50 2 (0.370370370 0.629629630 0.000000000)  
+             98) Nir>=0.1142 30    0 1 (1.000000000 0.000000000 0.000000000) *
+             99) Nir< 0.1142 105   20 2 (0.190476190 0.809523810 0.000000000)  
+              198) Red< 0.0991 17    2 1 (0.882352941 0.117647059 0.000000000) *
+              199) Red>=0.0991 88    5 2 (0.056818182 0.943181818 0.000000000) *
+         25) Red>=0.14965 293  161 2 (0.194539249 0.450511945 0.354948805)  
+           50) Blue_diss>=0.327381 195   72 2 (0.276923077 0.630769231 0.092307692)  
+            100) Nir>=0.124 80   34 1 (0.575000000 0.262500000 0.162500000)  
+              200) Blue>=0.1439 67   21 1 (0.686567164 0.313432836 0.000000000)  
+                400) Red_diss< 0.733631 43    1 1 (0.976744186 0.023255814 0.000000000) *
+                401) Red_diss>=0.733631 24    4 2 (0.166666667 0.833333333 0.000000000) *
+              201) Blue< 0.1439 13    0 4 (0.000000000 0.000000000 1.000000000) *
+            101) Nir< 0.124 115   13 2 (0.069565217 0.886956522 0.043478261)  
+              202) BT1< 262.8 11    4 1 (0.636363636 0.363636364 0.000000000) *
+              203) BT1>=262.8 104    6 2 (0.009615385 0.942307692 0.048076923) *
+           51) Blue_diss< 0.327381 98   12 4 (0.030612245 0.091836735 0.877551020) *
+       13) Blue< 0.09955 965  190 4 (0.194818653 0.002072539 0.803108808)  
+         26) Blue_diss>=0.6190476 105   17 1 (0.838095238 0.000000000 0.161904762)  
+           52) Nir>=0.04915 77    0 1 (1.000000000 0.000000000 0.000000000) *
+           53) Nir< 0.04915 28   11 4 (0.392857143 0.000000000 0.607142857)  
+            106) Blue< 0.07 17    6 1 (0.647058824 0.000000000 0.352941176) *
+            107) Blue>=0.07 11    0 4 (0.000000000 0.000000000 1.000000000) *
+         27) Blue_diss< 0.6190476 860  102 4 (0.116279070 0.002325581 0.881395349)  
+           54) Green< 0.08455 349   78 4 (0.223495702 0.000000000 0.776504298)  
+            108) BT1< 267.7 57    0 1 (1.000000000 0.000000000 0.000000000) *
+            109) BT1>=267.7 292   21 4 (0.071917808 0.000000000 0.928082192)  
+              218) Nir>=0.0483 10    0 1 (1.000000000 0.000000000 0.000000000) *
+              219) Nir< 0.0483 282   11 4 (0.039007092 0.000000000 0.960992908) *
+           55) Green>=0.08455 511   24 4 (0.043052838 0.003913894 0.953033268)  
+            110) Green_diss>=0.7792659 9    0 1 (1.000000000 0.000000000 0.000000000) *
+            111) Green_diss< 0.7792659 502   15 4 (0.025896414 0.003984064 0.970119522) *
+      7) BT1>=276.05 2377    0 4 (0.000000000 0.000000000 1.000000000) *", split = "\n")[[1]]
 
 output %>% 
   paste(collapse = "\n")
 ```
 
-## performance
+# more modeling ideas
+use caret package
+A Short Introduction to the caret Package: https://cran.r-project.org/web/packages/caret/vignettes/caret.html
+simulate forest using tree:
+https://github.com/ljmdeb/GSTA
+https://link.springer.com/chapter/10.1007/978-3-540-74958-5_39
+
+
+
+# In situ lake ice data
+
+## Global lake and river ice phenology dataset (GLRIP)
+
+## Import data
 
 ```{r}
-dat_wide_sr = (dat_wide %>% 
-  mutate(class_int = as.integer(class)) %>% 
-  filter(source == "SR"))[, c(1, 5, 8, 11, 13:23)]
+phenology = read_csv("data/Global_lake_and_river_ice_phenology_dataset/latest_version/liag_freeze_thaw_table.csv")
 
-require(rpart)
-require(rpart.plot)
+is_n999 = function(x) {
+  return(x != -999)
+}
 
-validation = dat_wide_sr %>% 
-  group_by(Hylak_id, Landsat) %>% 
+phenologyFil = phenology %>% 
+  filter(is_n999(iceon_year),
+         is_n999(iceon_month),
+         is_n999(iceon_day),
+         is_n999(iceoff_year),
+         is_n999(iceoff_month),
+         is_n999(iceoff_day),
+         is_n999(duration),
+         is_n999(latitude),
+         is_n999(longitude)) %>% 
+  filter(iceon_year >= 1984) %>% ## only include years where Landsat 5-8 have data for
+  mutate(lakecode = as.factor(lakecode),
+         lakename = as.factor(lakename),
+         lakeorriver = as.factor(lakeorriver),
+         country = as.factor(country),
+         season = as.factor(season),
+         froze = factor(froze, levels = c("Y", "N", "U"), labels = c(TRUE, FALSE, "uncertain")))
+
+summary(phenologyFil)
+
+print("how many stations?")
+phenologyFil %>% select(lakecode, lakeorriver) %>% distinct() %>% summary()
+
+GLRIP_data_availability_fig = phenologyFil %>% 
+  ggplot() +
+  geom_histogram(aes(x = season, fill = lakeorriver), stat = "count", position = "dodge") +
+  scale_y_continuous(expand = c(0, 0.1)) +
+  theme(axis.text.x = element_text(angle = 45, size = 8, hjust = 1),
+        axis.ticks.x = element_blank(),
+        title = element_text(size = 10)) +
+  labs(x = "Year",
+       y = "Count",
+       fill = "Waterbody\nType",
+       title = "Global lake and river ice phenology dataset (1984-): Data availability")
+
+GLRIP_data_availability_fig
+
+GLRIP_data_availability_fig %>% 
+  ggsave(filename = "figs/GLRIP_data_availability.png",
+         width = 6,
+         heigh = 3,
+         dpi = "print")
+```
+
+## Maps
+
+```{r}
+glrip = phenologyFil %>% 
+  mutate(date_FU = as.Date(paste(iceon_year, iceon_month, iceon_day, sep = "-")),
+         date_BU = as.Date(paste(iceoff_year, iceoff_month, iceoff_day, sep = "-"))) %>% 
+  select(lakecode,
+         lakename,
+         lakeorriver,
+         season,
+         date_FU,
+         date_BU,
+         duration,
+         latitude,
+         longitude,
+         country,
+         froze,
+         comments) %>% 
+  filter(lakeorriver == "L") %>% 
+  rename(id = lakecode)
+
+save(glrip, file = "outputs/GLRIP_cleaned.RData")
+
+
+## site specific summary stats
+
+dat_summary = glrip %>% 
+  group_by(id) %>% 
+  summarise(
+    latitude = first(latitude),
+    longitude = first(longitude),
+    n = n()
+  ) %>% 
+  ungroup()
+
+## attach site data
+
+# sites = read_csv(file = "data/Global_lake_and_river_ice_phenology_dataset/liag_physical_character_table.csv")
+# 
+# sites = sites %>% 
+#   select(lakecode, lat_decimal, lon_decimal)
+
+dat_summary_sf = dat_summary %>% 
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+save(dat_summary_sf, file = "outputs/glrip_sites.RData")
+
+require(rnaturalearth)
+cl = ne_countries(returnclass = "sf")
+
+crs = 3995
+
+bounds = dat_summary_sf %>% 
+  st_transform(crs = crs) %>% 
+  st_coordinates() %>% 
+  as_tibble() %>% 
+  summarise(xmin = min(X),
+            xmax = max(X),
+            ymin = min(Y),
+            ymax = max(Y))
+
+
+distribution_map = ggplot() +
+  geom_sf(data = cl, size = 0.4, color = "black") +
+  geom_sf(data = dat_summary_sf, aes(color = n), size = 1, alpha = 0.7) +
+  scale_colour_viridis_c(end = 0.7, trans = "log") +
+  labs(color = "Count") +
+  coord_sf(crs = st_crs(crs), 
+           xlim = c(bounds$xmin, bounds$xmax),
+           ylim = c(bounds$ymin, bounds$ymax))
+
+distribution_map
+
+distribution_map %>% 
+  ggsave(filename = "figs/distribution_map.png",
+         width = 6,
+         height = 4,
+         dpi = "print")
+
+require(tmap)
+
+tmap_mode("view")
+
+tm_basemap("Esri.WorldImagery") +
+  tm_shape(dat_summary_sf) +
+  tm_dots(col = "lakeorriver")
+```
+
+## output for gee processing
+
+```{r}
+require(lubridate)
+hl = st_read("~/Google_Drive/Map layers/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10.shp")
+
+gee_input_river_ice_glrip = glrip %>% 
+  group_by(id) %>% 
+  summarise(longitude = first(longitude),
+            latitude = first(latitude),
+            date1 = year(min(date_FU)),
+            date2 = year(max(date_BU)),
+            lakename = first(lakename)) %>% 
+  ungroup()
+
+## how many lakes
+gee_input_river_ice_glrip %>% select(id) %>% distinct() %>% nrow()
+
+glrip_hl_joint_table = gee_input_river_ice_glrip %>% 
+  mutate(lon = longitude,
+         lat = latitude) %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% 
+  rename(glrip_id = id) %>% 
+  st_join(hl %>% select(Hylak_id), left = T)
+
+glrip_hl_joint_table = glrip_hl_joint_table %>% 
+  na.omit() %>% 
+  st_drop_geometry()
+# %>% 
+#   st_drop_geometry() %>% 
+#   select(glrip, Hylak_id)
+
+hl_glrip = hl %>% 
+  inner_join(glrip_hl_joint_table, by = "Hylak_id")
+
+st_write(hl_glrip, dsn = "outputs/HydroLAKES_glrip_lakes.shp")
+
+# GEE script to look at the data
+# https://code.earthengine.google.com/11feb15dddb8fdde371a2a796e406891
+```
+
+## validate against in situ
+
+```{r}
+require(tidyverse)
+
+val = read_csv("data/lake_ice_fraction_glrip_334fb9223d737b85158b207b53e39be1.csv")
+
+version = "334fb9223d737b85158b207b53e39be1"
+
+load("outputs/GLRIP_cleaned.RData", verbose = T)
+
+val %>% select(glrip_id) %>% distinct()
+
+p1 = val %>% 
+  ggplot(aes(x = cartIce_mean, y = fmaskIce_mean)) +
+  # geom_hex(aes(fill = log10(..count..))) +
+  geom_point(aes(color = as.integer(cloud_mean * 100))) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_colour_viridis_c() +
+  labs(
+    x = "Ice fraction (CART)",
+    y = "Ice fraction (Fmask)",
+    color = "Cloud fraction (%)"
+  )
+
+p2 = val %>% 
+  gather(key = "method", value = "ice_fraction", c(cartIce_mean, fmaskIce_mean)) %>% 
+  mutate(method = factor(method, levels = c("cartIce_mean", "fmaskIce_mean"), labels = c("CART", "Fmask"))) %>% 
+  ggplot() +
+  geom_histogram(aes(x = ice_fraction, fill = method), alpha = 1, position = "dodge") +
+  scale_fill_viridis_d(end = 0.8) +
+  scale_y_log10() +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Ice fraction",
+    y = "Count",
+    fill = "Method"
+  )
+
+require(patchwork)
+merged_comp_fmask_cart = p2 - p1 + plot_layout(ncol = 1) +
+  plot_annotation(title = "Ice fraction comparison between Fmask and CART methods",
+                  subtitle = "for lakes in the GLRIP",
+                  tag_levels = "A")
+
+merged_comp_fmask_cart %>% 
+  ggsave(
+    filename = paste0("figs/", "merged_comp_fmask_cart_", version, ".png"),
+    width = 6,
+    height = 8
+  )
+
+## load in situ phenology data
+load("outputs/GLRIP_cleaned.RData", verbose = T)
+
+require(fuzzyjoin)
+require(foreach)
+
+interval_conditions_ice = glrip %>% 
+  mutate(date_start = date_FU,
+         date_end = date_BU) %>% 
+  mutate(`Ice cover` = T) %>% 
+  select(id, date_start, date_end, `Ice cover`)
+
+require(lubridate)
+interval_conditions_water = glrip %>% 
+  select(id, date_FU, date_BU, latitude, longitude) %>% 
+  # mutate(date_start = date_BU) %>% 
+  group_by(id, date_BU) %>% 
   do({
-    dat = . 
+    temp = .
     
-    this_training = dat_wide_sr %>% 
-      filter(Hylak_id != dat$Hylak_id[1],
-             Landsat == dat$Landsat[1]) %>% 
-      select(-Hylak_id, -Landsat, -fmask)
+    next_FU = glrip %>%
+      filter(
+        id == temp$id[1],
+        (date_FU - temp$date_BU[1]) > 0,
+        (date_FU - temp$date_BU[1]) <= 365)
     
-    set.seed(2020)
+    date_end = ifelse(test = nrow(next_FU) != 0, yes = next_FU$date_FU[1], no = NA)
     
-    sr_rpart = rpart(class~., data = this_training, method = "class")
-    min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"]
-    sr_rpart_prune = prune(sr_rpart, cp = min_cp)
-    pred_nw = predict(sr_rpart_prune, newdata = dat, type = "class")
-    
-    sr_rpart = rpart(class~., data = this_training, method = "class", weights = 1 + 1 * (this_training$class == "Water"))
-    min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"]
-    sr_rpart_prune = prune(sr_rpart, cp = min_cp)
-    pred_1w = predict(sr_rpart_prune, newdata = dat, type = "class")
-    
-    sr_rpart = rpart(class~., data = this_training, method = "class", weights = 1 + 3 * (this_training$class == "Water"))
-    min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"]
-    sr_rpart_prune = prune(sr_rpart, cp = min_cp)
-    pred_2w = predict(sr_rpart_prune, newdata = dat, type = "class")
-    
-    dat %>% bind_cols(tibble(pred_nw, pred_1w, pred_2w))
-
+    temp %>% 
+      mutate(
+        date_start = temp$date_BU[1],
+        date_end = date_end)
   }) %>% 
   ungroup()
 
-save(validation, file = "outputs/validation.RData")
+interval_conditions_water = interval_conditions_water %>% 
+  mutate(date_end = as.Date(date_end, origin = "1970-01-01")) %>% 
+  select(-date_FU, -date_BU, -longitude, -latitude) %>% 
+  mutate(`Ice cover` = F)
+  
 
-validation_fig = validation %>% 
-  gather(key = "model", value = "pred", c(pred_nw, pred_1w, pred_2w)) %>% 
-  ggplot() +
-  geom_bar(aes(x = class, fill = pred), position = "fill") +
-  facet_grid(model~Landsat) +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-  labs(
-    x = "Reference class",
-    y = "",
-    fill = "Predicted class"
-  ) +
-  scale_fill_manual(values = c("lightblue", "darkgrey", "white", "darkblue"))
+interval_conditions = bind_rows(interval_conditions_ice, interval_conditions_water) %>% 
+  filter(!is.na(date_end))
 
-validation_fig
-
-validation_fig %>% 
-  ggsave(
-    filename = "figs/validation_fig_water_var_weight.png",
-    width = 8,
-    height = 8,
-    dpi = 300
+## sanity check
+in_situ_date_range = interval_conditions %>% 
+  ggplot() + 
+  geom_segment(aes(x = date_start, xend = date_end, y = id, yend = id, color = `Ice cover`)) +
+  labs(x = "Date",
+       y = "Lake identifier") +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
   )
 
-validation %>% 
+in_situ_date_range %>% 
+  ggsave(
+    filename = "figs/in_situ_date_range.png",
+    width = 7,
+    height = 5
+  )
+
+## landsat date range
+
+val = val %>% 
+  mutate(date = as.Date(substr(LANDSAT_ID, start = 18, stop = 25), format = "%Y%m%d"))
+  
+## interval join
+
+merged_val = val %>% 
+  group_by(glrip_id) %>% 
+  do({
+    dat = .
+    dat %>% 
+      interval_inner_join(y = interval_conditions %>% 
+                            filter(id == dat$glrip_id[1]), by = c("date" = "date_start", "date" = "date_end"))
+  }) %>% 
+  ungroup
+
+## santy check
+merged_val %>% mutate(check = (date >= date_start) & (date <= date_end)) %>% summary()
+
+save(merged_val, file = "outputs/merged_val.RData")
+
+validation_in_situ = merged_val %>% 
+  filter(cloud_mean <= 0.1) %>% 
+  gather(key = "Method", value = "Ice fraction", c(fmaskIce_mean, cartIce_mean)) %>% 
   ggplot() +
-  geom_bar(aes(fmask, fill = pred_nw)) +
-  scale_fill_manual(values = c("lightblue", "darkgrey", "white", "darkblue"))
+  geom_histogram(aes(x = `Ice fraction`, fill = `Ice cover`)) +
+  facet_wrap(~Method)
+
+validation_in_situ
+
+validation_in_situ %>% 
+  ggsave(filename = paste0("figs/validation_in_situ_", version, ".png"),
+         width = 8,
+         height = 5)
+
+## what about during the transition period
+merged_val %>% 
+  filter(cloud_mean <= 0.1) %>% 
+  mutate(transition = ((abs(date - date_start) <= 15) | abs(date - date_end) <= 15)) %>% 
+  filter(transition) %>% 
+  gather(key = "Method", value = "Ice fraction", c(fmaskIce_mean, cartIce_mean)) %>% 
+  ggplot() +
+  geom_histogram(aes(x = `Ice fraction`, fill = `Ice cover`)) +
+  facet_wrap(~Method)
 ```
+
+
+
+<!-- ## performance (leave lake out approach) -->
+
+<!-- ```{r} -->
+<!-- require(rpart) -->
+
+<!-- dat_wide_sr = (dat_wide %>%  -->
+<!--   mutate(class_int = as.integer(class)) %>%  -->
+<!--   filter(source == "SR"))[, c(1, 3, 8:9, 11:21)] -->
+
+<!-- validation = dat_wide_sr %>%  -->
+<!--   group_by(Hylak_id, Landsat) %>%  -->
+<!--   do({ -->
+<!--     dat = .  -->
+
+<!--     this_training_1Landsat = dat_wide_sr %>%  -->
+<!--       filter(Hylak_id != dat$Hylak_id[1], -->
+<!--              Landsat == dat$Landsat[1]) %>%  -->
+<!--       select(-Hylak_id, -Landsat, -fmask) -->
+
+<!--     this_training_3Landsat = dat_wide_sr %>%  -->
+<!--       filter(Hylak_id != dat$Hylak_id[1]) %>%  -->
+<!--       select(-Hylak_id, -Landsat, -fmask) -->
+
+<!--     set.seed(2020) -->
+
+<!--     sr_rpart = rpart(class~., data = this_training_1Landsat, method = "class") -->
+<!--     min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"] -->
+<!--     sr_rpart_prune = prune(sr_rpart, cp = min_cp) -->
+<!--     pred_1ls = predict(sr_rpart_prune, newdata = dat, type = "class") -->
+
+<!--     sr_rpart = rpart(class~., data = this_training_3Landsat, method = "class") -->
+<!--     min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"] -->
+<!--     sr_rpart_prune = prune(sr_rpart, cp = min_cp) -->
+<!--     pred_3ls = predict(sr_rpart_prune, newdata = dat, type = "class") -->
+
+<!--     # sr_rpart = rpart(class~., data = this_training, method = "class", weights = 1 + 1 * (this_training$class == "Water")) -->
+<!--     # min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"] -->
+<!--     # sr_rpart_prune = prune(sr_rpart, cp = min_cp) -->
+<!--     # pred_1w = predict(sr_rpart_prune, newdata = dat, type = "class") -->
+<!--     #  -->
+<!--     # sr_rpart = rpart(class~., data = this_training, method = "class", weights = 1 + 3 * (this_training$class == "Water")) -->
+<!--     # min_cp = sr_rpart$cptable[which.min(sr_rpart$cptable[,"xerror"]),"CP"] -->
+<!--     # sr_rpart_prune = prune(sr_rpart, cp = min_cp) -->
+<!--     # pred_2w = predict(sr_rpart_prune, newdata = dat, type = "class") -->
+
+<!--     # dat %>% bind_cols(tibble(pred_nw, pred_1w, pred_2w)) -->
+<!--     dat %>% bind_cols(tibble(pred_1ls, pred_3ls)) -->
+
+<!--   }) %>%  -->
+<!--   ungroup() -->
+
+<!-- ## how consistent between the two classifiers? -->
+<!-- validation %>%  -->
+<!--   ggplot() + -->
+<!--   geom_bar(aes(x = pred_1ls, fill = pred_3ls)) + -->
+<!--   facet_wrap(~Landsat) + -->
+<!--   scale_fill_manual(values = join_table$color) -->
+
+<!-- validation = validation %>%  -->
+<!--   gather(key = "model", value = "pred", c(pred_1ls, pred_3ls)) -->
+
+<!-- save(validation, file = "outputs/validation_6class.RData") -->
+
+<!-- validation %>%  -->
+<!--   ggplot() + -->
+<!--   geom_bar(aes(x = class, fill = pred)) + -->
+<!--   facet_grid(model~Landsat) + -->
+<!--   scale_fill_manual(values = join_table %>% arrange(class) %>% pull(color)) -->
+
+<!-- accuracy = validation %>%  -->
+<!--   group_by(class, model, Landsat) %>%  -->
+<!--   summarise( -->
+<!--     accuracy = round(sum(pred == class[1]) / n() * 100, digits = 0) -->
+<!--   ) %>%  -->
+<!--   ungroup() %>%  -->
+<!--   spread(key = model, value = accuracy) -->
+
+<!-- names(accuracy) = c("Class", "Landsat", "Accuracy 1LS", "Accuracy 3LS") -->
+
+<!-- require("formattable") -->
+<!-- formattable(accuracy, list(`Accuracy 1LS` = color_bar("lightgreen", function(x) {return(x / 100)}), -->
+<!--                            `Accuracy 3LS` = color_bar("lightgreen", function(x) {return(x / 100)}))) -->
+
+<!-- require(gt) -->
+<!-- accuracy %>%  -->
+<!--   gt() %>%  -->
+<!--   tab -->
+
+<!-- ylabs = c("Same sensor", "All sensors") -->
+<!-- names(ylabs) = c("pred_1ls", "pred_3ls") -->
+<!-- xlabs = paste("Landsat", c("5", "7", "8")) -->
+<!-- names(xlabs) = c("5", "7", "8") -->
+
+<!-- validation_stack_percent_fig = validation %>%  -->
+<!--   ggplot() + -->
+<!--   geom_bar(aes(x = class, fill = pred), position = "fill") + -->
+<!--   facet_grid(model~Landsat, labeller = labeller(model = ylabs, Landsat = xlabs)) + -->
+<!--   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + -->
+<!--   labs( -->
+<!--     x = "Manually identified class", -->
+<!--     y = "Percent", -->
+<!--     fill = "Predicted class" -->
+<!--   ) + -->
+<!--   scale_fill_manual(values = join_table %>% arrange(class) %>% pull(color)) + -->
+<!--   theme(axis.text.x = element_text(angle = 45, hjust = 1)) -->
+
+<!-- validation_stack_percent_fig -->
+
+<!-- validation_stack_N_fig = validation %>%  -->
+<!--   ggplot() + -->
+<!--   geom_bar(aes(x = class, fill = pred)) + -->
+<!--   facet_grid(model~Landsat, labeller = labeller(model = ylabs, Landsat = xlabs)) + -->
+<!--   labs( -->
+<!--     x = "Manually identified class", -->
+<!--     y = "Count", -->
+<!--     fill = "Predicted class" -->
+<!--   ) + -->
+<!--   scale_fill_manual(values = join_table %>% arrange(class) %>% pull(color)) + -->
+<!--   theme(axis.text.x = element_text(angle = 45, hjust = 1)) -->
+
+<!-- validation_stack_N_fig -->
+
+<!-- merged_jk_validation = validation_stack_N_fig - validation_stack_percent_fig + -->
+<!--   plot_layout(ncol = 2, guides = "collect") + plot_annotation(title = "Validation (leave lake out)", tag_levels = "A") -->
+
+<!-- merged_jk_validation -->
+
+<!-- merged_jk_validation %>%  -->
+<!--   ggsave( -->
+<!--     filename = "figs/validation_Jackknife_resampling.png", -->
+<!--     width = 12, -->
+<!--     height = 8, -->
+<!--     dpi = 300 -->
+<!--   ) -->
+<!-- #  -->
+<!-- # validation %>%  -->
+<!-- #   ggplot() + -->
+<!-- #   geom_bar(aes(fmask, fill = pred_nw)) + -->
+<!-- #   scale_fill_manual(values = c("lightblue", "darkgrey", "white", "darkblue")) -->
+<!-- ``` -->
 
