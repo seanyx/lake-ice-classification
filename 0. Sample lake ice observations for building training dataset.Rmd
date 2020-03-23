@@ -67,3 +67,70 @@ subsamples %>% select(Hylak_id) %>% distinct %>% nrow()
 write_csv(subsamples, path = "outputs/subsamples_training_lakes_20190802.csv")
 ```
 
+## added extra training images
+
+```{r}
+set.seed(seed = 2019)
+samples2 = model_input %>% 
+  mutate(lif = n_ice / n_clear) %>% 
+  filter(lif >= 0, lif <= 1) %>% 
+  mutate(temp_grp = cut(temp, breaks = seq(-49, 43, length = 11), include.lowest = T)) %>% 
+  group_by(temp_grp) %>% 
+  sample_n(100, replace = F) %>% 
+  ungroup()
+
+samples2 %>% select(LANDSAT_SCENE_ID) %>% distinct
+samples2 %>% select(Hylak_id) %>% distinct
+
+samples2 %>% 
+  ggplot() +
+  geom_histogram(aes(x = Lake_area), bins = 30) +
+  scale_x_log10()
+
+set.seed(2019)
+subsamples = samples2 %>% 
+  group_by(Hylak_id) %>% 
+  sample_n(1) %>% 
+  ungroup
+
+subsamples %>% 
+  ggplot() +
+  geom_histogram(aes(x = Lake_area), bins = 30) +
+  scale_x_log10()
+
+subsamples %>% select(LANDSAT_SCENE_ID) %>% distinct %>% nrow()
+subsamples %>% select(Hylak_id) %>% distinct %>% nrow()
+
+write_csv(subsamples, path = "outputs/subsamples_training_lakes_20200323.csv")
+```
+
+
+```{r}
+subsamples1 = read_csv("outputs/subsamples_training_lakes_20190802.csv") %>% 
+  mutate(batch = 1)
+
+subsamples2 = read_csv("outputs/subsamples_training_lakes_20200323.csv") %>% 
+  mutate(batch = 2)
+
+subsamples_merged = bind_rows(subsamples1, subsamples2)
+
+
+## add glacial fed lakes (four lakes in New Zealand)
+# https://earthobservatory.nasa.gov/images/145055/how-glaciers-turn-lakes-turquoise
+ids = c(1703, 16678, 16679, 16680)
+
+gfl = model_input %>% 
+  mutate(Hylak_id = as.integer(Hylak_id)) %>% 
+  right_join(tibble(Hylak_id = ids), by = "Hylak_id")
+
+gfl = gfl %>% 
+  mutate(batch = 3) %>% 
+  mutate(lif = n_ice / n_clear) %>% 
+  filter(lif >= 0, lif <= 1)
+
+subsamples_merged = subsamples_merged %>% 
+  bind_rows(gfl)
+
+write_csv(subsamples_merged, path = "outputs/lake_ids_Landsat_ids.csv")
+```
+
