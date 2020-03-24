@@ -6,6 +6,14 @@ output: html_document
 ---
 
 
+## project steps
+1. subsample lakes from lake ice dataset then export to GEE to derive training dataset (0. Sample lake ice observations for building training dataset)
+2. attach SR image id to each record (Prepare_lake_id_and_image_id.js)
+2. manually draw polygons of various lake ice class in GEE (f91f43f44d796d8f2b8c65c50b774f55w650p2)
+3. subsample the pixels in the polygons and download the data to R
+4. build a classification tree model in R (this script) and validation with the manually selected data, and also compare it with Fmask
+5. apply the classifier in GEE to lakes having in situ lake ice data, export results, evaluate performance v.s. Fmask and in situ records.
+
 ## To dos
 * test removing both snow and cloud classes
 * test removing Land class
@@ -887,13 +895,15 @@ st_write(hl_glrip, dsn = "outputs/HydroLAKES_glrip_lakes.shp")
 ```{r}
 require(tidyverse)
 
-val = read_csv("data/lake_ice_fraction_glrip_334fb9223d737b85158b207b53e39be1.csv")
+val = read_csv("data/lake_ice_fraction_glrip_db018e78a618b03f16df5d604ac4e4b5.csv")
 
-version = "334fb9223d737b85158b207b53e39be1"
+version = "db018e78a618b03f16df5d604ac4e4b5"
 
 load("outputs/GLRIP_cleaned.RData", verbose = T)
 
 val %>% select(glrip_id) %>% distinct()
+
+val = val %>% na.omit()
 
 p1 = val %>% 
   ggplot(aes(x = cartIce_mean, y = fmaskIce_mean)) +
@@ -927,6 +937,8 @@ merged_comp_fmask_cart = p2 - p1 + plot_layout(ncol = 1) +
   plot_annotation(title = "Ice fraction comparison between Fmask and CART methods",
                   subtitle = "for lakes in the GLRIP",
                   tag_levels = "A")
+
+merged_comp_fmask_cart
 
 merged_comp_fmask_cart %>% 
   ggsave(
@@ -990,6 +1002,8 @@ in_situ_date_range = interval_conditions %>%
     axis.ticks.y = element_blank()
   )
 
+in_situ_date_range
+
 in_situ_date_range %>% 
   ggsave(
     filename = "figs/in_situ_date_range.png",
@@ -1017,14 +1031,17 @@ merged_val = val %>%
 ## santy check
 merged_val %>% mutate(check = (date >= date_start) & (date <= date_end)) %>% summary()
 
-save(merged_val, file = "outputs/merged_val.RData")
+save(merged_val, file = paste0("outputs/merged_val_", version, ".RData"))
 
 validation_in_situ = merged_val %>% 
   filter(cloud_mean <= 0.1) %>% 
   gather(key = "Method", value = "Ice fraction", c(fmaskIce_mean, cartIce_mean)) %>% 
   ggplot() +
   geom_histogram(aes(x = `Ice fraction`, fill = `Ice cover`)) +
-  facet_wrap(~Method)
+  facet_wrap(~Method) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(fill = "In situ\nice cover",
+       y = "Count")
 
 validation_in_situ
 
@@ -1034,17 +1051,126 @@ validation_in_situ %>%
          height = 5)
 
 ## what about during the transition period
-merged_val %>% 
+validation_in_situ_transition_period = merged_val %>% 
   filter(cloud_mean <= 0.1) %>% 
   mutate(transition = ((abs(date - date_start) <= 15) | abs(date - date_end) <= 15)) %>% 
   filter(transition) %>% 
   gather(key = "Method", value = "Ice fraction", c(fmaskIce_mean, cartIce_mean)) %>% 
   ggplot() +
   geom_histogram(aes(x = `Ice fraction`, fill = `Ice cover`)) +
-  facet_wrap(~Method)
+  facet_wrap(~Method) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(fill = "In situ\nice cover",
+       y = "Count")
+
+validation_in_situ_transition_period
+
+validation_in_situ_transition_period %>% 
+  ggsave(filename = paste0("figs/validation_in_situ_transition_period_", version, ".png"),
+         width = 8,
+         height = 5)
+
+inspection = merged_val %>% 
+  filter(cloud_mean <= 0.1) %>% 
+  filter((cartIce_mean >= 0.5 & `Ice cover` == F) | (cartIce_mean <= 0.5 & `Ice cover` == T)) %>% 
+  dplyr::select(Hylak_id, LANDSAT_ID, cartIce_mean, fmaskIce_mean, glrip_id, date, `Ice cover`) %>% 
+  arrange(desc(date))
 ```
 
 
+## test reticulate visualize lakes
+<!-- https://philippgaertner.github.io/2019/12/earth-engine-rstudio-reticulate/ -->
+```{r}
+require(reticulate)
+require(tidyverse)
+require(raster)
+use_condaenv("testGEE", conda = "auto", required = TRUE)
+
+ee = import("ee")          # Import the Earth Engine library
+ee$Initialize()            # Trigger the authentication
+
+np = import("numpy")       # Import Numpy 
+pd = import("pandas")      # Import Pandas
+
+## image collections
+ls5 = ee$ImageCollection("LANDSAT/LT05/C01/T1_SR")$select(c("B3", "B2", "B1"), c("Red", "Green", "Blue"))
+ls7 = ee$ImageCollection("LANDSAT/LE07/C01/T1_SR")$select(c("B3", "B2", "B1"), c("Red", "Green", "Blue"))
+ls8 = ee$ImageCollection("LANDSAT/LC08/C01/T1_SR")$select(c("B4", "B3", "B2"), c("Red", "Green", "Blue"))
+ls = ls5$merge(ls7)$merge(ls8)
+
+## hydroLAKES
+hl = ee$FeatureCollection("users/eeProject/HydroLAKES_polys_v10")
+
+for (i in 1:nrow(inspection)) {
+  print(paste("Exporting", i, "of", nrow(inspection)))
+  
+  thisRecord = inspection[i, ]
+  thisLakeId = thisRecord$Hylak_id
+  thisImgId = thisRecord$LANDSAT_ID
+  thisLake = ee$Feature(hl$filterMetadata("Hylak_id", "equals", thisLakeId)$first())
+  
+  
+  ## create lake shore raster
+  thisLakeShore = thisLake$setGeometry(ee$Geometry$LineString(ee$List(thisLake$geometry()$coordinates())$get(0)))
+  # print(thisLakeShore$getInfo())
+  thisLakeShoreRaster = ee$Image(0)$toByte()$paint(ee$FeatureCollection(c(thisLakeShore)), 1)$selfMask()$visualize(min = 1, max = 1, palette = c("Red"))
+  
+  ## filter image
+  geometry = thisLake$geometry()$bounds()
+  lsFil = ls$filterMetadata("LANDSAT_ID", "equals", thisImgId)
+  
+  if (lsFil$size()$getInfo() == 1) {
+    
+    thisImg = ee$Image(lsFil$first())
+    
+    rgbImg = thisImg$visualize(bands = "Red,Green,Blue", min = 0, max = 5000, gamma = 1.5)
+    
+    ## overlay lake shore on top of rgb image
+    compImg = rgbImg$blend(thisLakeShoreRaster)
+    
+    url = compImg$getThumbURL(list(dimensions = "800", region = geometry$getInfo(), format = "png"))
+    
+    rgbRaster = stack(url, bands = 1:3)
+    
+    ## save image to harddisk
+    png(filename = paste0("figs/pngs/",thisRecord$LANDSAT_ID, "_", thisRecord$Hylak_id, ".png"), width = 800, height = 800, bg = "black")
+    
+    plotRGB(rgbRaster, colNA = "black")
+    
+    ## add annotation
+    dimension = dim(rgbRaster)
+    ymax = dimension[1]
+    xmax = dimension[2]
+    textString = paste0(
+      "Image ID: ", thisRecord$LANDSAT_ID, "\n",
+      "Lake ID: ", thisRecord$Hylak_id, "\n",
+      "\n",
+      "Date: ", thisRecord$date, "\n",
+      "Ice cover (in situ): ", thisRecord$`Ice cover`, "\n",
+      "Ice cover (CART): ", format(thisRecord$cartIce_mean * 100, digits = 1), "%\n",
+      "Ice cover (Fmask): ", format(thisRecord$fmaskIce_mean * 100, digits = 1), "%\n")
+    graphics::text(x = xmax * 0.05, y = ymax * 0.95, labels = textString, col = "orange", adj = c(0, 1), cex = 1.2)
+    dev.off()
+    }
+  
+}
+
+
+plotRGB(rgbRaster, colNA = "black", bgalpha = 0)
+dimension = dim(rgbRaster)
+ymax = dimension[1]
+xmax = dimension[2]
+textString = paste0(
+  "Image ID: ", thisRecord$LANDSAT_ID, "\n",
+  "Lake ID: ", thisRecord$Hylak_id, "\n",
+  "\n",
+  "Date: ", thisRecord$date, "\n",
+  "Ice cover (in situ): ", thisRecord$`Ice cover`, "\n",
+  "Ice cover (CART): ", format(thisRecord$cartIce_mean * 100, digits = 1), "%\n",
+  "Ice cover (Fmask): ", format(thisRecord$fmaskIce_mean * 100, digits = 1), "%\n")
+graphics::text(x = xmax * 0.05, y = ymax * 0.95, labels = textString, col = "black", adj = c(0, 1), cex = 0.8)
+graphics::text(x = xmax * 0.055, y = ymax * 0.955, labels = textString, col = "yellow", adj = c(0, 1), cex = 0.8)
+```
 
 <!-- ## performance (leave lake out approach) -->
 
