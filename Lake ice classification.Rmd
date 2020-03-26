@@ -888,6 +888,16 @@ st_write(hl_glrip, dsn = "outputs/HydroLAKES_glrip_lakes.shp")
 
 # GEE script to look at the data
 # https://code.earthengine.google.com/11feb15dddb8fdde371a2a796e406891
+
+## check lake name across datasets
+hl_glrip = st_read(dsn = "outputs/HydroLAKES_glrip_lakes.shp")
+hl_glrip %>% 
+  st_drop_geometry() %>% 
+  select(Hylak_id, Lake_name, glrip_id) %>% 
+  distinct() %>% 
+  left_join(glrip %>% select(glrip_id = id, lakename) %>% distinct(), by = "glrip_id") %>% 
+  # as_tibble %>% 
+  print(n.max = 100)
 ```
 
 ## validate against in situ
@@ -901,14 +911,17 @@ version = "db018e78a618b03f16df5d604ac4e4b5"
 
 load("outputs/GLRIP_cleaned.RData", verbose = T)
 
-val %>% select(glrip_id) %>% distinct()
-
 val = val %>% na.omit()
+
+## map lakes in the validation
+# glrip
+
+val %>% select(glrip_id) %>% distinct()
 
 p1 = val %>% 
   ggplot(aes(x = cartIce_mean, y = fmaskIce_mean)) +
   # geom_hex(aes(fill = log10(..count..))) +
-  geom_point(aes(color = as.integer(cloud_mean * 100))) +
+  geom_point(aes(color = as.integer(cloud_mean * 100)), pch = 1, alpha = 0.8) +
   scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
   scale_colour_viridis_c() +
@@ -1032,6 +1045,70 @@ merged_val = val %>%
 merged_val %>% mutate(check = (date >= date_start) & (date <= date_end)) %>% summary()
 
 save(merged_val, file = paste0("outputs/merged_val_", version, ".RData"))
+
+## map of lake locations used available for validation
+merged_val %>% filter(cloud_mean <= 0.1) %>% nrow()
+merged_val %>% filter(cloud_mean <= 0.1) %>% select(id) %>% distinct
+
+require(sf)
+lakes = merged_val %>% 
+  filter(cloud_mean <= 0.1) %>% 
+  group_by(id) %>% 
+  count() %>% 
+  ungroup() %>% 
+  left_join(glrip %>% select(id, lon = longitude, lat = latitude) %>% distinct, by = "id") %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+xylim = calculate_map_bounds(minlat = -55, maxlat = 80, minlon = -180, maxlon = 180, crs = 54030)
+xymin = xylim[1:2]
+xymax = xylim[3:4]
+world = rnaturalearthdata::countries50 %>% st_as_sf %>% 
+  st_transform(crs = 54030)
+
+map = lakes %>% 
+  st_transform(crs = 54030) %>% 
+  ggplot() +
+  geom_sf(data = world, fill = "black", color = NA) +
+  geom_sf(data = glrip %>% select(id, longitude, latitude) %>% distinct %>% st_as_sf(coords = c("longitude", "latitude"), crs = 4326), aes(color = "Lakes with\nin situ data"), pch = 1, size = 0.1, show.legend = F) +
+  geom_sf(aes(size = n), pch = 1, alpha = 0.5, color = "cyan") +
+  scale_color_manual(values = c("orange")) +
+  coord_sf(crs = st_crs(54030), 
+           xlim = c(xymin[1], xymax[1]), 
+           ylim = c(xymin[2], xymax[2]),
+           expand = T) +
+  labs(size = "Number of instances",
+       color = "") +
+  theme(
+    legend.position = c(0.125, 0.25)
+  )
+  
+map
+
+map %>% ggsave(filename = paste("figs/in_situ_data_map_", version, ".png"), width = 8, height = 4)
+
+
+## validation stats
+merged_val %>% 
+  filter(cloud_mean <= 0.1) %>% 
+  gather(key = "method", value = "ice_fraction", c(fmaskIce_mean, cartIce_mean)) %>% 
+  mutate(dif = ice_fraction - `Ice cover`) %>% 
+  group_by(method) %>% 
+  summarise(
+    mbs = mean(dif),
+    rmse = sqrt(mean(dif^2)),
+    mae = abs(mean(dif))) %>% 
+  ungroup()
+
+merged_val %>% 
+  filter(cloud_mean <= 0.1) %>% 
+  gather(key = "method", value = "ice_fraction", c(fmaskIce_mean, cartIce_mean)) %>% 
+  mutate(correct = (ice_fraction >= 0.8 & `Ice cover` == T) | (ice_fraction <= 0.2 & `Ice cover` == F)) %>% 
+  group_by(method, `Ice cover`) %>% 
+  summarise(
+    accuracy = sum(correct) / n()
+    ) %>% 
+  ungroup()
+
 
 validation_in_situ = merged_val %>% 
   filter(cloud_mean <= 0.1) %>% 
