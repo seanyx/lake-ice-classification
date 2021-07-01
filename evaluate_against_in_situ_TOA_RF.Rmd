@@ -1,0 +1,813 @@
+---
+title: "evaluate_against_in_situ_TOA_RF"
+author: "Xiao Yang"
+date: "6/9/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(tidyverse)
+
+calculate_map_bounds = function(minlat, maxlat, minlon, maxlon, crs) {
+  line1 = st_linestring(x = matrix(c(minlon, minlat, maxlon, maxlat), byrow = T, nrow = 2), dim = "XY")
+  line2 = st_linestring(x = matrix(c(minlon, maxlat, maxlon, minlat), byrow = T, nrow = 2), dim = "XY")
+  output = st_as_sfc(list(line1, line2), crs = 4326) %>% st_transform(crs) %>% st_bbox
+  
+  return(output)
+}
+```
+
+### Matching in situ and Landsat-derived ice fraction for GLRIP dataset
+
+```{r}
+require(tidyverse)
+require(fuzzyjoin)
+require(foreach)
+require(lubridate)
+
+## import lake ice fraction data
+val = read_csv("data/lake_ice_fraction_glrip_TOA_06292020_e26b3b2955b1e8165de4882653d059ba.csv")
+version_insitu = "06292020_e26b3b2955b1e8165de4882653d059ba"
+val = val %>% na.omit()
+val = val %>% 
+  mutate(date = as.Date(substr(LANDSAT_SCENE_ID, start = 10, stop = 16), format = "%Y%j"))
+
+print("How many lakes export from GEE after calculating lake ice fraction?")
+val %>% select(glrip_id) %>% distinct() %>% nrow()
+
+## gather ice fraction from various cart models
+val = val %>% gather(key = "model", value = "ice_fraction", c(RFSnowIce, FmaskSnowIce))
+
+## import in situ lake ice data
+load("outputs/GLRIP_cleaned_location_corrected.RData", verbose = T)
+# 
+# ## convert phenological dates to intervals of ice cover and ice free
+# interval_conditions_ice = glrip %>% 
+#   mutate(date_start = date_FU,
+#          date_end = date_BU) %>% 
+#   mutate(`Ice cover` = T) %>% 
+#   select(id, date_start, date_end, `Ice cover`)
+# 
+# interval_conditions_water = glrip %>% 
+#   select(id, date_FU, date_BU, latitude, longitude) %>% 
+#   # mutate(date_start = date_BU) %>% 
+#   group_by(id, date_BU) %>% 
+#   do({
+#     temp = .
+#     
+#     next_FU = glrip %>%
+#       filter(
+#         id == temp$id[1],
+#         (date_FU - temp$date_BU[1]) > 0,
+#         (date_FU - temp$date_BU[1]) <= 365)
+#     
+#     date_end = ifelse(test = nrow(next_FU) != 0, yes = next_FU$date_FU[1], no = NA)
+#     
+#     temp %>% 
+#       mutate(
+#         date_start = temp$date_BU[1],
+#         date_end = date_end)
+#   }) %>% 
+#   ungroup()
+# 
+# interval_conditions_water = interval_conditions_water %>% 
+#   mutate(date_end = as.Date(date_end, origin = "1970-01-01")) %>% 
+#   select(-date_FU, -date_BU, -longitude, -latitude) %>% 
+#   mutate(`Ice cover` = F)
+#   
+# interval_conditions = bind_rows(interval_conditions_ice, interval_conditions_water) %>% 
+#   filter(!is.na(date_end))
+# 
+# save(interval_conditions, file = "outputs/interval_lake_ice_conditions.RData")
+
+load("outputs/interval_lake_ice_conditions.RData", verbose = T)
+
+## sanity check
+in_situ_date_range = interval_conditions %>% 
+  ggplot() + 
+  geom_segment(aes(x = date_start, xend = date_end, y = id, yend = id, color = `Ice cover`)) +
+  labs(x = "Date",
+       y = "Lake identifier") +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+in_situ_date_range
+
+in_situ_date_range %>% 
+  ggsave(
+    filename = "figs/in_situ_date_range.png",
+    width = 7,
+    height = 5
+  )
+  
+
+## interval join
+
+merged_val = val %>% 
+  group_by(glrip_id) %>% 
+  do({
+    dat = .
+    dat %>% 
+      interval_inner_join(y = interval_conditions %>% 
+                            filter(id == dat$glrip_id[1]), by = c("date" = "date_start", "date" = "date_end"))
+  }) %>% 
+  ungroup
+
+merged_val = merged_val %>% select(-`system:index`) %>% filter(cloud <= 0.1)
+
+## sanity check
+merged_val %>% mutate(check = (date >= date_start) & (date <= date_end)) %>% summary()
+
+save(merged_val, file = paste0("outputs/merged_val_", version_insitu, ".RData"))
+
+load(paste0("outputs/merged_val_", version_insitu, ".RData"), verbose = T)
+
+print("How many cases after matching spatially and temporarily between in situ and Landsat-derived ice fraction?")
+merged_val %>% filter(model == "RFSnowIce") %>% nrow()
+
+print("How many lakes left after matching spatially and temporarily between in situ and Landsat-derived ice fraction?")
+merged_val %>% select(id) %>% distinct %>% nrow()
+
+print("How many images left after matching spatially and temporarily between in situ and Landsat-derived ice fraction?")
+merged_val %>% select(LANDSAT_SCENE_ID) %>% distinct %>% nrow()
+
+## map of lake locations used available for validation
+require(sf)
+lakes = merged_val %>% 
+  filter(model == "RFSnowIce") %>% 
+  group_by(id) %>% 
+  count() %>% 
+  ungroup() %>% 
+  left_join(glrip %>% select(id, lon = longitude, lat = latitude) %>% distinct, by = "id") %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+## add in alaska lakes
+load("outputs/validation_alaska_reformatted.RData", verbose = T)
+lakes_alaska = validation_alaska_reformatted %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% 
+  count(id)
+
+lakes = rbind(lakes %>% mutate(id = as.character(id)), lakes_alaska %>% mutate(id = as.character(id)))
+
+xylim = calculate_map_bounds(minlat = 40, maxlat = 90, minlon = 90, maxlon = 180, crs = 3995)
+xmax_abs = max(abs(xylim[c(1, 3)]))
+ymax_abs = max(abs(xylim[c(2, 4)]))
+world = rnaturalearthdata::countries50 %>% st_as_sf %>% 
+  st_transform(crs = 3995)
+
+map = lakes %>% 
+  st_transform(crs = 3995) %>% 
+  ggplot() +
+  geom_sf(data = world, fill = "black", color = NA) +
+  geom_sf(aes(size = n), pch = 1, alpha = 0.4, color = "cyan") +
+  geom_sf(pch = 1, size = 0.1, show.legend = F, color = "orange") +
+  coord_sf(crs = st_crs(3995),
+           xlim = c(-xmax_abs, xmax_abs),
+           ylim = c(-ymax_abs, ymax_abs),
+           expand = T) +
+  labs(size = "Number of instances",
+       color = "") +
+  scale_size_area(max_size = 7) +
+  theme(panel.grid.major = element_line(color = "white", size = 0.5),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        line = element_blank(),
+        rect = element_blank(),
+        text = element_text(size = 10),
+        panel.grid = element_blank(),
+        legend.position = c(0.4, 0.9),
+        legend.direction = "horizontal",
+        # legend.position = "top",
+        axis.title = element_blank())
+  
+map
+
+map %>% ggsave(filename = paste("figs/in_situ_data_map_", version_insitu, ".png"), width = 3.5, height = 3.5)
+
+
+# ## check relationship with lake size and shoreline complexity
+# merged_val_sizeshore = merged_val %>% 
+#   filter(cloud_mean <= 0.1) %>% 
+#   left_join(hl %>% st_drop_geometry() %>% select(Hylak_id, Lake_area, Shore_dev), by = "Hylak_id")
+# 
+# ## distribution of lake area and lake shoreline complextiy
+# merged_val_sizeshore %>% 
+#   gather(key = "lake_characteristics", value = "value", c(Lake_area, Shore_dev)) %>% 
+#   ggplot() +
+#   geom_histogram(aes(x = value)) +
+#   scale_x_log10() +
+#   facet_wrap(~lake_characteristics, scales = "free_x") +
+#   labs(x = "lake characteristics", y = "Count")
+# 
+# merged_val_sizeshore %>% 
+#   # filter(transition) %>% 
+#   mutate(complex_grp = cut(Shore_dev, breaks = unique(quantile(Shore_dev, probs = seq(0, 1, by = 0.1))), include.lowest = T),
+#          size_grp = cut(Lake_area, breaks = unique(quantile(Lake_area, probs = seq(0, 1, by = 0.1))), include.lowest = T),
+#          diff_cartIce = cartIce_mean - `Ice cover`,
+#          diff_fmaskIce = fmaskIce_mean - `Ice cover`) %>% 
+#   gather(key = "metric", value = "value", c(complex_grp, size_grp)) %>% 
+#   ggplot() +
+#   geom_violin(aes(x = value, y = diff_cartIce)) +
+#   facet_wrap(~metric, ncol = 1)
+#   # scale_colour_viridis_c() +
+#   # scale_x_log10() +
+#   # scale_y_log10()
+#   ## it is inconclusive whether size and shoreline complexity affect the com
+```
+
+### Evaluating against in situ
+
+```{r}
+load(paste0("outputs/merged_val_", version_insitu, ".RData"), verbose = T)
+load("outputs/validation_alaska_reformatted.RData", verbose = T)
+
+merged_val = merged_val %>% mutate(id = as.character(id)) %>% bind_rows(
+  validation_alaska_reformatted %>% select(-lon, -lat, -name) %>% mutate(id = as.character(id))
+)
+
+merged_val = merged_val %>% 
+  filter((date != date_start) & (date != date_end))
+
+save(merged_val, file = "outputs/validation_merged_alaska_glrip.RData")
+
+## how many alaskan lakes
+validation_alaska_reformatted %>% select(Hylak_id) %>% distinct() %>% nrow()
+## how many glrip lakes (excluding alaskan lakes)
+merged_val %>% select(glrip_id) %>% distinct() %>% nrow()
+## how many hydrolakes
+merged_val %>% select(Hylak_id) %>% distinct() %>% nrow()
+## how many matchups 
+merged_val %>% filter(model == "RFSnowIce") %>% nrow()
+
+output = merged_val %>% 
+  spread(key = "model", value = "ice_fraction") %>% 
+  mutate(transition = ((abs(date - date_start) <= 15) | abs(date - date_end) <= 15)) %>% 
+  mutate(pcolor = factor(`Ice cover`, levels = c(T, F), labels = c("cyan", "orange")))
+
+compare_in_situ = output %>% 
+  filter(transition) %>%
+  mutate(insitu = factor(`Ice cover`, levels = c(T, F), labels = c("Ice cover", "Ice free"))) %>% 
+  ggplot() + 
+  geom_abline(aes(slope = 1, intercept = 0, lty = "1:1 line"), color = "black", lwd = 0.5, alpha = 0.5) +
+  geom_point(aes(x = RFSnowIce, y = FmaskSnowIce, color = insitu), pch = 3, alpha = 0.5, cex = 0.3) +
+  scale_x_continuous(labels = scales::percent_format(1), expand = c(0.01, 0.01)) +
+  scale_y_continuous(labels = scales::percent_format(1), expand = c(0.01, 0.01)) +
+  scale_color_discrete(direction = -1) +
+  coord_fixed() %>% 
+  labs(
+    x = "SLIDE-derived ice fraction",
+    y = "Fmask-derived ice fraction",
+    color = "Ice condition\nfrom in situ",
+    lty = ""
+  ) +
+  theme_bw() +
+  theme(legend.position = c(0.2, 0.7),
+        # legend.position = "bottom",
+        # legend.background = element_rect(fill = "grey", color = "black"),
+        text = element_text(size = 10))
+  # facet_grid(transition~insitu)
+
+compare_in_situ
+
+compare_in_situ %>% 
+  ggsave(filename = paste0("figs/compare_in_situ_", version_insitu, ".png"),
+         width = 3.5,
+         height = 3.5)
+  # geom_bin2d(aes(x = RFSnowIce, y = FmaskSnowIce, fill = log(..count..)), alpha = 1) +
+  # facet_grid(transition~`Ice cover`) +
+  # scale_fill_viridis_c()
+
+output %>% 
+  # filter(transition) %>%
+  ggplot() + 
+  geom_histogram(aes(x = RFSnowIce, fill = `Ice cover`), alpha = 1) +
+  facet_wrap(~transition)
+
+write_csv(output, path = paste0("outputs/merged_val_", version_insitu, ".csv"))
+
+## validation stats
+
+merged_val = merged_val %>% 
+  rename(lif = ice_fraction) %>%
+  # gather(key = "ls_ice", value = "lif", c(RFSnowice, fmaskIce_mean)) %>%
+  mutate(lif_binary = lif >= 0.5,
+         lif_diff = lif - `Ice cover`) %>%
+  mutate(lif_binary = factor(lif_binary, levels = c(T, F), labels = c("Ice", "Water")),
+         `Ice cover` = factor(`Ice cover`, levels = c(T, F), labels = c("Ice", "Water")),
+         period = as.character(`Ice cover`)) %>% 
+  mutate(transition = ((abs(date - date_start) <= 15) | abs(date - date_end) <= 15))
+
+merged_val = merged_val %>% 
+  mutate(transition_period = "all") %>% 
+  bind_rows(merged_val %>% filter(transition) %>% mutate(transition_period = "Yes"))
+
+merged_val = merged_val %>% 
+  bind_rows(merged_val %>% mutate(period = "All")) 
+
+evaluation_summary = merged_val %>% 
+  group_by(period, transition_period, model) %>% 
+  do({
+    dat = .
+    tmp = dat %>% 
+      summarise(RMSE = sqrt(mean(lif_diff^2)) %>% scales::percent(accuracy = 0.1),
+                MBS = mean(lif_diff) %>% scales::percent(accuracy = 0.1),
+                MAE = mean(abs(lif_diff)) %>% scales::percent(accuracy = 0.1))
+    
+    cf = caret::confusionMatrix(data = dat$lif_binary, reference = dat$`Ice cover`)$overall
+    tmp %>% bind_cols(tibble(Accuracy = cf['Accuracy'] %>% scales::percent(accuracy = 0.1), Kappa = cf['Kappa'] %>% scales::percent(accuracy = 0.1)))
+  }) %>% 
+  ungroup() %>% 
+  arrange(period)
+
+evaluation_summary
+```
+
+
+```{r}
+### evaluation between lakes of different sizes
+load("outputs/validation_merged_alaska_glrip.RData", verbose = T)
+require(sf)
+hl = st_read("~/Google_Drive/Map layers/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10.shp") %>% 
+  st_drop_geometry() %>% as_tibble
+
+merged_val = merged_val %>% 
+  rename(lif = ice_fraction) %>%
+  # gather(key = "ls_ice", value = "lif", c(RFSnowice, fmaskIce_mean)) %>%
+  mutate(lif_binary = lif >= 0.5,
+         lif_diff = lif - `Ice cover`) %>%
+  mutate(lif_binary = factor(lif_binary, levels = c(T, F), labels = c("Ice", "Water")),
+         `Ice cover` = factor(`Ice cover`, levels = c(T, F), labels = c("Ice", "Water")),
+         period = as.character(`Ice cover`)) %>% 
+  mutate(transition = ((abs(date - date_start) <= 15) | abs(date - date_end) <= 15))
+
+merged_val = merged_val %>% 
+  mutate(transition = ((abs(date - date_start) <= 15) | abs(date - date_end) <= 15))
+
+merged_val = merged_val %>% 
+  mutate(transition_period = "all") %>% 
+  bind_rows(merged_val %>% filter(transition) %>% mutate(transition_period = "Yes"))
+
+merged_val_size = merged_val %>% 
+  left_join(hl %>% select(Hylak_id, Lake_area), by = "Hylak_id")
+
+merged_val_size %>% ggplot() + geom_histogram(aes(x = Lake_area), bins = 50) + scale_x_log10() + geom_vline(data = tibble(xi = c(0.81, 100)), aes(xintercept = xi), color = "red")
+
+cutoffs = c(0.81, 100)
+
+eval_summary = merged_val_size %>% 
+  mutate(size_grp = cut(Lake_area, breaks = c(0, cutoffs, 2000), labels = c("small", "medium", "large"))) %>% 
+  group_by(transition_period, size_grp, model) %>% 
+  do({
+    dat = .
+    tmp = dat %>% 
+      summarise(RMSE = sqrt(mean(lif_diff^2)) %>% scales::percent(accuracy = 0.1),
+                MBS = mean(lif_diff) %>% scales::percent(accuracy = 0.1),
+                MAE = mean(abs(lif_diff)) %>% scales::percent(accuracy = 0.1))
+    
+    cf = caret::confusionMatrix(data = dat$lif_binary, reference = dat$`Ice cover`)$overall
+    tmp %>% bind_cols(tibble(Accuracy = cf['Accuracy'] %>% scales::percent(accuracy = 0.1), Kappa = cf['Kappa'] %>% scales::percent(accuracy = 0.1)))
+  }) %>% 
+  ungroup() %>% 
+  arrange(transition_period)
+
+eval_summary %>% filter(model == "RFSnowIce")
+
+eval_long = eval_summary %>% 
+  pivot_wider(names_from = "model", values_from = RMSE:Kappa) %>%
+  pivot_longer(cols = RMSE_FmaskSnowIce:Kappa_RFSnowIce, names_to = "metric", values_to = "value") %>% 
+  separate(col = metric, sep = "_", into = c("metric", "model")) %>% 
+  mutate(value = parse_number(value) / 100) %>% 
+  pivot_wider(names_from = model, values_from = value)
+
+require(ggalt)
+temp = eval_long %>% 
+  filter(metric %in% c("RMSE", "MBS", "MAE")) %>% 
+  mutate(new_grp = paste(metric, size_grp, sep = "_")) %>% 
+  mutate(facet = factor(transition_period, levels = c("all", "Yes"), labels = c("Entire dataset", "Transitional period")))
+
+error_size_fig = temp %>% 
+  pivot_longer(cols = FmaskSnowIce:RFSnowIce, names_to = "model", values_to = "value") %>% 
+  mutate(model = factor(model, levels = c("FmaskSnowIce", "RFSnowIce"), labels = c("Fmask", "SLIDE"))) %>% 
+  ggplot() +
+  geom_vline(aes(xintercept = 0), lty = 3) +
+  geom_segment(data = temp, aes(x = FmaskSnowIce, xend = RFSnowIce, y = new_grp, yend = new_grp, group = metric, color = metric)) +
+  geom_point(aes(x = value, y = new_grp, shape = model)) +
+  scale_x_continuous(labels = scales::percent_format(1)) +
+  scale_shape_discrete(solid = F) +
+  labs(shape = "",
+       color = "Error metric") +
+  facet_wrap(~facet, ncol = 1) +
+  labs(x = "", y = "") +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_line(),
+    text = element_text(size = 10))
+
+error_size_fig
+
+error_size_fig %>% ggsave(filename = "figs/error_size_fig.png",
+                          width = 5,
+                          height = 6)
+```
+
+
+```{r}
+### evaluation between lakes of different latitude
+load("outputs/validation_merged_alaska_glrip.RData", verbose = T)
+require(sf)
+hl = st_read("~/Google_Drive/Map layers/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10.shp") %>% 
+  st_drop_geometry() %>% as_tibble
+
+merged_val = merged_val %>% 
+  rename(lif = ice_fraction) %>%
+  mutate(lif_binary = lif >= 0.5,
+         lif_diff = lif - `Ice cover`) %>%
+  mutate(lif_binary = factor(lif_binary, levels = c(T, F), labels = c("Ice", "Water")),
+         `Ice cover` = factor(`Ice cover`, levels = c(T, F), labels = c("Ice", "Water")),
+         period = as.character(`Ice cover`)) %>% 
+  mutate(transition = ((abs(date - date_start) <= 15) | abs(date - date_end) <= 15))
+
+merged_val = merged_val %>% 
+  mutate(transition = ((abs(date - date_start) <= 15) | abs(date - date_end) <= 15))
+
+merged_val = merged_val %>% 
+  mutate(transition_period = "all") %>% 
+  bind_rows(merged_val %>% filter(transition) %>% mutate(transition_period = "Yes"))
+
+merged_val_lat = merged_val %>% 
+  left_join(hl %>% select(Hylak_id, Pour_lat), by = "Hylak_id")
+
+merged_val_lat %>% ggplot() + geom_histogram(aes(x = Pour_lat), bins = 50)
+  # scale_x_log10() + 
+  # geom_vline(data = tibble(xi = c(0.81, 100)), aes(xintercept = xi), color = "red")
+
+cutoffs = c(45, 60)
+
+eval_summary = merged_val_lat %>% 
+  mutate(lat_grp = cut(Pour_lat, breaks = c(35, cutoffs, 75), labels = c("Low lat", "Medium lat", "High lat"))) %>% 
+  group_by(transition_period, lat_grp, model) %>% 
+  do({
+    dat = .
+    tmp = dat %>% 
+      summarise(RMSE = sqrt(mean(lif_diff^2)) %>% scales::percent(accuracy = 0.1),
+                MBS = mean(lif_diff) %>% scales::percent(accuracy = 0.1),
+                MAE = mean(abs(lif_diff)) %>% scales::percent(accuracy = 0.1))
+    
+    cf = caret::confusionMatrix(data = dat$lif_binary, reference = dat$`Ice cover`)$overall
+    tmp %>% bind_cols(tibble(Accuracy = cf['Accuracy'] %>% scales::percent(accuracy = 0.1), Kappa = cf['Kappa'] %>% scales::percent(accuracy = 0.1)))
+  }) %>% 
+  ungroup() %>% 
+  arrange(transition_period)
+
+eval_summary %>% filter(model == "RFSnowIce")
+
+eval_long = eval_summary %>% 
+  pivot_wider(names_from = "model", values_from = RMSE:Kappa) %>%
+  pivot_longer(cols = RMSE_FmaskSnowIce:Kappa_RFSnowIce, names_to = "metric", values_to = "value") %>% 
+  separate(col = metric, sep = "_", into = c("metric", "model")) %>% 
+  mutate(value = parse_number(value) / 100) %>% 
+  pivot_wider(names_from = model, values_from = value)
+
+require(ggalt)
+temp = eval_long %>% 
+  filter(metric %in% c("RMSE", "MBS", "MAE")) %>% 
+  mutate(new_grp = paste(metric, lat_grp, sep = "_")) %>% 
+  mutate(facet = factor(transition_period, levels = c("all", "Yes"), labels = c("Entire dataset", "Transitional period")))
+
+error_lat_fig = temp %>% 
+  pivot_longer(cols = FmaskSnowIce:RFSnowIce, names_to = "model", values_to = "value") %>% 
+  mutate(model = factor(model, levels = c("FmaskSnowIce", "RFSnowIce"), labels = c("Fmask", "SLIDE"))) %>% 
+  ggplot() +
+  geom_vline(aes(xintercept = 0), lty = 3) +
+  geom_segment(data = temp, aes(x = FmaskSnowIce, xend = RFSnowIce, y = new_grp, yend = new_grp, group = metric, color = metric)) +
+  geom_point(aes(x = value, y = new_grp, shape = model)) +
+  scale_x_continuous(labels = scales::percent_format(1)) +
+  scale_shape_discrete(solid = F) +
+  labs(shape = "",
+       color = "Error metric") +
+  facet_wrap(~facet, ncol = 1) +
+  labs(x = "", y = "") +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_line(),
+    text = element_text(size = 10))
+
+error_lat_fig
+
+error_lat_fig %>% ggsave(filename = "figs/error_lat_fig.png",
+                          width = 5,
+                          height = 6)
+
+# evaluation_summary %>% 
+#   filter(model %in% c("cart_Ice_mean"),
+#          period == "All") %>% 
+#   mutate(
+#     transition_period = factor(transition_period, levels = c("all", "Yes"), labels = c("Entire dataset", "Transitional period")),
+#     ls_ice = factor(ls_ice, levels = c("cartIce_mean", "fmaskIce_mean"), labels = c("CART32", "Fmask"))
+#   ) %>% 
+#   arrange(transition_period) %>% 
+#   select(Model = ls_ice, Subset = transition_period, RMSE, MBS, MAE, Accuracy, Kappa) %>% 
+#   write_csv(path = "outputs/evaluation_in_situ_summary.csv")
+
+# evaluation_summary %>% 
+#   gather(key = "metric", value = "value", c(rmse, mbs, mae)) %>% 
+#   ggplot() +
+#   geom_bar(aes(x = metric, y = value, fill = ls_ice), stat = "identity", position = "dodge") +
+#   facet_grid(transition_period~period)
+  
+
+## test sensitivity of threshold value h
+
+h_sensitivity = tibble(h_ic = seq(0.1, 0.9, by = 0.05)) %>% 
+  group_by(h_ic) %>% 
+  do({
+    dat = .
+    this_h_ic = dat$h_ic[1]
+    
+    merged_val %>% 
+      mutate(correct = (lif >= this_h_ic & `Ice cover` == "Ice") | (lif < this_h_ic & `Ice cover` == "Water")) %>% 
+      group_by(period, transition_period, model) %>% 
+      summarise(
+        accuracy = sum(correct) / n()
+        ) %>% 
+      ungroup()
+    
+  }) %>% 
+  ungroup()
+
+h_sens_fig = h_sensitivity %>% ##%>% select(h_ic, h_if, method, accuracy_merged) %>% distinct %>% 
+  # filter(model == "cart_Ice_mean") %>% 
+  mutate(transition_period = factor(transition_period, levels = c("all", "Yes"), labels = c("Entire dataset", "Transitional period")),
+         model = factor(model, levels = c("cartBarbieux", "FmaskSnowIce", "RFSnowIce"), labels = c("Barbieux et al., 2018", "Fmask", "Random Forest")),
+         period = factor(period, levels = c("Ice", "Water", "All"), labels = c("Ice", "Water", "Both"), ordered = T)) %>% 
+  filter(model %in% c("Fmask", "Random Forest")) %>% 
+  ggplot() +
+  geom_line(aes(x = h_ic, y = accuracy, lty = model, color = period)) +
+  geom_point(aes(x = h_ic, y = accuracy, pch = model, color = period)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0.4, 1)) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_colour_manual(values = c("cyan", "blue", "black")) +
+  labs(x = "Ice cover threshold",
+       y = "Accuracy",
+       color = "In situ\nlake condition",
+       lty = "Model",
+       pch = "Model") +
+  facet_wrap(~transition_period, scales = "free_y")
+
+h_sens_fig
+
+h_sens_fig %>% 
+  ggsave(filename = paste0("figs/h_sens_fig_", version_insitu, ".png"),
+         width = 8,
+         height = 4)
+```
+
+### visualize downloaded geotiffs
+
+```{r}
+require(tidyverse)
+require(raster)
+
+folder = "visual_inspection"
+fileDir = "data/visual_inspection"
+
+fileInfo = tibble(filename = dir(path = fileDir, pattern = "*.tif"), filePath = dir(path = fileDir, pattern = "*.tif", full.names = T)) %>% 
+  separate(filename, into = c("LANDSAT_SCENE_ID", "rest"), sep = "_") %>% 
+  separate(rest, into = c("Hylak_id", NULL), sep = "\\.") %>% 
+  mutate(Hylak_id = as.integer(Hylak_id)) %>% 
+  left_join(merged_val, by = c("LANDSAT_SCENE_ID", "Hylak_id")) %>% 
+  spread(key = "model", value = "ice_fraction")
+
+for (i in 1:nrow(fileInfo)) {
+  thisRecord = fileInfo[i, ]
+  rgbRaster = stack(thisRecord$filePath, bands = 1:3)
+  
+  ## save image to harddisk
+  png(filename = paste0("figs/", folder, "/",thisRecord$LANDSAT_SCENE_ID, "_", thisRecord$Hylak_id, ".png"), width = 800, height = 800, bg = "black")
+  plotRGB(rgbRaster, colNA = "black", stretch = "lin")
+  ## add annotation
+  ext = extent(rgbRaster)
+  xlabel = ext@xmin + (ext@xmax - ext@xmin) * 0.05
+  ylabel = ext@ymin + (ext@ymax - ext@ymin) * 0.95
+  
+  textString = paste0(
+    "Image ID: ", thisRecord$LANDSAT_SCENE_ID, "\n",
+    "GLRIP ID: ", thisRecord$glrip_id, "\n",
+    "HydroLAKES ID: ", thisRecord$Hylak_id, "\n",
+    "\n",
+    "Date: ", thisRecord$date, "\n",
+    "Ice cover (in situ): ", thisRecord$`Ice cover`, "\n",
+    "Ice cover (RF): ", format(thisRecord$RFSnowIce * 100, digits = 1), "%\n",
+    "Ice cover (Fmask): ", format(thisRecord$FmaskSnowIce * 100, digits = 1), "%\n")
+  graphics::text(x = xlabel, y = ylabel, labels = textString, col = "red", adj = c(0, 1), cex = 1.2)
+  dev.off()
+}
+
+    
+
+
+## add annotation
+dimension = dim(rgbRaster)
+ymax = dimension[1]
+xmax = dimension[2]
+textString = paste0(
+  "Image ID: ", thisRecord$LANDSAT_ID, "\n",
+  "GLRIP ID: ", thisRecord$glrip_id, "\n",
+  "HydroLAKES ID: ", thisRecord$Hylak_id, "\n",
+  "\n",
+  "Date: ", thisRecord$date, "\n",
+  "Ice cover (in situ): ", thisRecord$`Ice cover`, "\n",
+  "Ice cover (CART): ", format(thisRecord$cartIce_mean * 100, digits = 1), "%\n",
+  "Ice cover (Fmask): ", format(thisRecord$fmaskIce_mean * 100, digits = 1), "%\n")
+graphics::text(x = xmax * 0.05, y = ymax * 0.95, labels = textString, col = "orange", adj = c(0, 1), cex = 1.2)
+dev.off()
+
+dat = read_stars(fileDir)
+```
+
+### Visually inspect 100 images
+
+```{r}
+require(tidyverse)
+dat_vis = read_csv("data/evaluate100records_70336352ea275a945c9d818d64940f73 - ice_record.csv")
+dat_vis2 = read_csv("data/evaluate100records_f798c9f50675bae985e4b5c82ab2a398 - ice_fraction.csv")[78:100, ] %>% 
+  mutate(ice_fraction_visual = as.numeric(ice_fraction_visual))
+
+dat_vis = bind_rows(dat_vis, dat_vis2)
+
+load(paste0("outputs/merged_val_", version_insitu, ".RData"), verbose = T)
+
+dat_vis = dat_vis %>% 
+  left_join(merged_val %>% select(id, LANDSAT_SCENE_ID, `Ice cover`, model, ice_fraction), by = c("id", "LANDSAT_SCENE_ID")) %>% 
+  distinct() %>% 
+  spread(key = "model", value = "ice_fraction") %>% 
+  filter((date != date_start) & (date != date_end))
+
+dat_vis %>% 
+  ggplot() +
+  geom_bar(aes(x = `Ice cover`, fill = factor(ice_fraction_visual)))
+
+dat_vis %>% 
+  gather(key = "error_visual", value = "value", c(comission, omission)) %>% 
+  ggplot() +
+  geom_bar(aes(x = factor(ice_fraction_visual), fill = value)) +
+  facet_wrap(~error_visual)
+
+summary(dat_vis)
+
+summary(dat_vis %>% filter(is.na(ice_fraction_visual)) %>% mutate(notes = as.factor(notes)))
+
+dat_vis %>% filter(comission) %>% select(notes, comments)
+
+dat_vis %>% filter(omission) %>% select(notes, comments) %>% print(n = 40)
+
+dat_vis %>% filter(!is.na(ice_fraction_visual), `Ice cover` == T) %>% mutate(ice_fraction_visual = as.factor(ice_fraction_visual)) %>% summary()
+
+dat_vis %>% filter(!is.na(ice_fraction_visual), `Ice cover` == F) %>% mutate(ice_fraction_visual = as.factor(ice_fraction_visual)) %>% summary()
+
+dat_vis %>% filter(`Ice cover` == T, ice_fraction_visual == 1) %>% select(id, LANDSAT_SCENE_ID)
+```
+
+
+### Visually evaluate prediction
+<!-- https://philippgaertner.github.io/2019/12/earth-engine-rstudio-reticulate/ -->
+```{r}
+require(tidyverse)
+require(reticulate)
+
+load(paste0("outputs/merged_val_", version_insitu, ".RData"), verbose = T)
+
+inspection = merged_val %>% 
+  spread(key = "model", value = "ice_fraction") %>% 
+  mutate(transition = ((abs(date - date_start) <= 15) | abs(date - date_end) <= 15)) %>% 
+  select(Hylak_id, LANDSAT_SCENE_ID, RFSnowIce, FmaskSnowIce, glrip_id, date, `Ice cover`) %>% 
+  filter((RFSnowIce >= 0.5 & `Ice cover` == F) | (RFSnowIce <= 0.5 & `Ice cover` == T)) %>% 
+  arrange(`Ice cover`)
+
+# inspection = merged_val %>% 
+#   filter((cartIce_mean >= 0.5 & `Ice cover` == F) | (cartIce_mean <= 0.5 & `Ice cover` == T)) %>% 
+#   dplyr::select(Hylak_id, LANDSAT_SCENE_ID, cartIce_mean, fmaskIce_mean, glrip_id, date, `Ice cover`) %>% 
+#   arrange(`Ice cover`)
+
+save(inspection, file = paste0("outputs/inspection_", version_insitu, ".RData"))
+
+folder = "visual_pngs"
+
+require(reticulate)
+require(tidyverse)
+require(raster)
+
+load(paste0("outputs/inspection_", version_insitu, ".RData"), verbose = T)
+
+inspection = inspection %>% 
+  group_by(`Ice cover`) %>% 
+  sample_n(100, replace = F) %>% 
+  ungroup()
+
+use_condaenv("testGEE", conda = "auto", required = TRUE)
+
+ee = import("ee")          # Import the Earth Engine library
+ee$Initialize()            # Trigger the authentication
+
+np = import("numpy")       # Import Numpy 
+pd = import("pandas")      # Import Pandas
+
+## image collections
+ls5 = ee$ImageCollection("LANDSAT/LT05/C01/T1_TOA")$select(c("B3", "B2", "B1"), c("Red", "Green", "Blue"))
+ls7 = ee$ImageCollection("LANDSAT/LE07/C01/T1_SR")$select(c("B3", "B2", "B1"), c("Red", "Green", "Blue"))
+ls8 = ee$ImageCollection("LANDSAT/LC08/C01/T1_SR")$select(c("B4", "B3", "B2"), c("Red", "Green", "Blue"))
+ls = ls5$merge(ls7)$merge(ls8)
+
+## hydroLAKES
+hl = ee$FeatureCollection("users/eeProject/HydroLAKES_polys_v10")
+
+for (i in 1:nrow(inspection)) {
+  print(paste("Exporting", i, "of", nrow(inspection)))
+  
+  thisRecord = inspection[i, ]
+  thisLakeId = thisRecord$Hylak_id
+  thisImgId = thisRecord$LANDSAT_ID
+  thisLake = ee$Feature(hl$filterMetadata("Hylak_id", "equals", thisLakeId)$first())
+  
+  
+  ## create lake shore raster
+  thisLakeShore = thisLake$setGeometry(ee$Geometry$LineString(ee$List(thisLake$geometry()$coordinates())$get(0)))
+  # print(thisLakeShore$getInfo())
+  thisLakeShoreRaster = ee$Image(0)$toByte()$paint(ee$FeatureCollection(c(thisLakeShore)), 1)$selfMask()$visualize(min = 1, max = 1, palette = c("Red"))
+  
+  ## filter image
+  geometry = thisLake$geometry()$bounds()
+  lsFil = ls$filterMetadata("LANDSAT_ID", "equals", thisImgId)
+  
+  if (lsFil$size()$getInfo() == 1) {
+    
+    thisImg = ee$Image(lsFil$first())
+    
+    rgbImg = thisImg$visualize(bands = "Red,Green,Blue", min = 0, max = 5000, gamma = 1.5)
+    
+    ## overlay lake shore on top of rgb image
+    compImg = rgbImg$blend(thisLakeShoreRaster)
+    
+    url = compImg$getThumbURL(list(dimensions = "800", region = geometry$getInfo(), format = "png"))
+    
+    rgbRaster = stack(url, bands = 1:3)
+    
+    ## save image to harddisk
+    png(filename = paste0("figs/", folder, "/",thisRecord$LANDSAT_ID, "_", thisRecord$Hylak_id, ".png"), width = 800, height = 800, bg = "black")
+    
+    plotRGB(rgbRaster, colNA = "black")
+    
+    ## add annotation
+    dimension = dim(rgbRaster)
+    ymax = dimension[1]
+    xmax = dimension[2]
+    textString = paste0(
+      "Image ID: ", thisRecord$LANDSAT_ID, "\n",
+      "GLRIP ID: ", thisRecord$glrip_id, "\n",
+      "HydroLAKES ID: ", thisRecord$Hylak_id, "\n",
+      "\n",
+      "Date: ", thisRecord$date, "\n",
+      "Ice cover (in situ): ", thisRecord$`Ice cover`, "\n",
+      "Ice cover (CART): ", format(thisRecord$cartIce_mean * 100, digits = 1), "%\n",
+      "Ice cover (Fmask): ", format(thisRecord$fmaskIce_mean * 100, digits = 1), "%\n")
+    graphics::text(x = xmax * 0.05, y = ymax * 0.95, labels = textString, col = "orange", adj = c(0, 1), cex = 1.2)
+    dev.off()
+    }
+  
+}
+
+
+plotRGB(rgbRaster, colNA = "black", bgalpha = 0)
+dimension = dim(rgbRaster)
+ymax = dimension[1]
+xmax = dimension[2]
+textString = paste0(
+  "Image ID: ", thisRecord$LANDSAT_ID, "\n",
+  "Lake ID: ", thisRecord$Hylak_id, "\n",
+  "\n",
+  "Date: ", thisRecord$date, "\n",
+  "Ice cover (in situ): ", thisRecord$`Ice cover`, "\n",
+  "Ice cover (CART): ", format(thisRecord$cartIce_mean * 100, digits = 1), "%\n",
+  "Ice cover (Fmask): ", format(thisRecord$fmaskIce_mean * 100, digits = 1), "%\n")
+graphics::text(x = xmax * 0.05, y = ymax * 0.95, labels = textString, col = "black", adj = c(0, 1), cex = 0.8)
+graphics::text(x = xmax * 0.055, y = ymax * 0.955, labels = textString, col = "yellow", adj = c(0, 1), cex = 0.8)
+```
+
+
+## validation commission and ommission errors
+
+```{r}
+dat = read_csv("data/validationData.csv")
+caret::confusionMatrix(data = factor(dat$pred, levels = c(1, 0), labels = c("ice", "water")), reference = factor(dat$class_int, levels = c(1, 0), labels = c("ice", "water")))
+
+caret::confusionMatrix(data = factor(dat$fmaskSnowIce, levels = c(1, 0), labels = c("ice", "water")), reference = factor(dat$class_int, levels = c(1, 0), labels = c("ice", "water")))
+```
+

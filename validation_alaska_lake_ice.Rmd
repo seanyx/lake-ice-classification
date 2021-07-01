@@ -1,0 +1,273 @@
+---
+title: "validation_alaska_lake_ice"
+author: "Xiao Yang"
+date: "3/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(tidyverse)
+require(lubridate)
+require(sf)
+```
+
+```{r}
+val_alaska = readxl::read_xlsx("data/IcePhenologyRecords_initialset_20201216.xlsx", sheet = "Data")
+
+val_alaska = val_alaska %>% 
+  filter(WaterbodyType == "lake") %>% 
+  filter(Year >= 1984) %>% 
+  mutate(date = as.Date(paste0(Year, "-", month(DOY), "-", day(DOY)), format = c("%Y-%m-%d"))) %>% 
+  select(-Date) %>% 
+  filter(!is.na(Method)) %>% 
+  select(-DOY, -WaterbodyType)
+
+val_alaska = val_alaska %>% mutate(
+  sensor = case_when(
+    str_detect(Method, "in-situ sensor") ~ "in situ",
+    str_detect(Method, "satellite") ~ "satellite",
+    TRUE ~ "others"),
+  manual = case_when(
+    str_detect(Method, "manuel|manual") ~ "manual",
+    TRUE ~ "others"
+  )) %>% 
+  separate(Event, sep = " >|<", into = c("event", "threshold")) %>% 
+  mutate(threshold = parse_number(threshold) / 100,
+         event = str_remove(event, pattern = " $"))
+
+val_alaska %>% skimr::skim()
+val_alaska %>% View
+val_alaska %>% count(WaterbodyName, sort = T)
+val_alaska %>% count(Year, sort = T)
+
+```
+
+## Match lake coords with Hydrolakes and export to GEE to calculate ice fraction
+
+```{r}
+lakes = val_alaska %>% 
+  select(Lat_DD, Long_DD, WaterbodyName) %>% 
+  distinct() %>% 
+  mutate(x = Long_DD,
+         y = Lat_DD) %>% 
+  st_as_sf(coords = c("x", "y"), crs = 4326)
+
+st_write(lakes, dsn = "outputs/alaska_lakes_with_insitu.shp")
+
+hl = st_read("~/Google_Drive/Map layers/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10.shp")
+
+nrow(lakes)
+lakes_hl = lakes %>% 
+  st_join(hl %>% select(Hylak_id), left = T)
+
+## we lost 9 lakes when matching with HydroLAKES
+lakes_hl = lakes_hl %>% filter(!is.na(Hylak_id)) %>% 
+  st_drop_geometry() %>% 
+  left_join(hl %>% select(Hylak_id) %>% rename(), by = "Hylak_id") %>% 
+  st_as_sf
+
+st_write(lakes_hl, dsn = "outputs/alaska_hl_lakes_insitu.shp")
+```
+
+## convert lake ice phenology dates to intervals
+
+```{r}
+
+# some lakes have multiple distinct coordinates
+val_alaska %>% 
+  select(Lat_DD, Long_DD, WaterbodyName) %>% 
+  distinct() %>% arrange(WaterbodyName) %>% View
+
+val_alaska$WaterbodyName %>% unique() %>% length()
+val_alaska %>% 
+  count(WaterbodyName) %>% 
+  mutate(WaterBodyName = fct_reorder(WaterbodyName, n)) %>% 
+  ggplot() +
+  geom_col(aes(x = WaterBodyName, y = n))
+
+## constrain data so that each lake only has at most 2 dates each year
+val_alaska %>% pivot_wider(c(Season, date)) %>% 
+  mutate(doy = yday(date)) %>% 
+  ggplot(aes(x = doy, fill = Season)) +
+  geom_histogram(color = "white", alpha = 0.7)
+
+### use doy = 225 to divide Event date into ice years
+val_alaska %>% group_by(Season) %>% mutate(doy = yday(date)) %>% summarise(doymin = min(doy), doymax = max(doy))
+
+
+### by looking at the min and max of doy for ice-on and ice-off, there was no ice-on after doy 365 and no ice-off before doy 1
+val_alaska = val_alaska %>% 
+  mutate(doy = yday(date),
+         ice_year = case_when(
+           doy <= 225 ~ Year - 1,
+           TRUE ~ Year
+         ),
+         cal_year = year(date))
+
+## derive ice free and ice cover intervals
+
+ice_free_intervals = val_alaska %>% 
+  group_by(Long_DD, Lat_DD, WaterbodyName, cal_year) %>% 
+  filter(Season == "break-up") %>% 
+  arrange(desc(threshold), sensor) %>% 
+  slice(n = 1) %>% 
+  ungroup() %>% 
+  bind_rows(
+    val_alaska %>% 
+      group_by(Long_DD, Lat_DD, WaterbodyName, cal_year) %>% 
+      filter(Season == "freeze-up") %>% 
+      arrange(threshold, sensor) %>% 
+      slice(n = 1) %>% 
+      ungroup()
+  ) %>% 
+  select(-doy, -ice_year, -Method, -Year) %>% 
+  pivot_wider(names_from = Season,
+              values_from = c(date, sensor, event, threshold, Source))
+
+ice_cover_intervals = val_alaska %>% 
+  group_by(Long_DD, Lat_DD, WaterbodyName, ice_year) %>% 
+  filter(Season == "break-up") %>% 
+  arrange(threshold, sensor) %>% 
+  slice(n = 1) %>% 
+  ungroup() %>% 
+  bind_rows(
+    val_alaska %>% 
+      group_by(Long_DD, Lat_DD, WaterbodyName, ice_year) %>% 
+      filter(Season == "freeze-up") %>% 
+      arrange(desc(threshold), sensor) %>% 
+      slice(n = 1) %>% 
+      ungroup()
+  ) %>% 
+  select(-doy, -cal_year, -Method, -Year) %>% 
+  pivot_wider(names_from = Season,
+              values_from = c(date, sensor, event, threshold, Source))
+
+merged_intervals = ice_free_intervals %>% 
+  filter((!is.na(`date_freeze-up`)) & (!is.na(`date_break-up`))) %>% 
+  select(-cal_year) %>% 
+  mutate(status = "ice_free",
+         date1 = `date_break-up`,
+         date2 = `date_freeze-up`) %>% 
+  bind_rows(ice_cover_intervals %>% 
+      filter((!is.na(`date_freeze-up`)) & (!is.na(`date_break-up`))) %>% 
+      select(-ice_year) %>% 
+      mutate(status = "ice_cover",
+           date2 = `date_break-up`,
+           date1 = `date_freeze-up`))
+
+save(ice_free_intervals, 
+     ice_cover_intervals,
+     merged_intervals, 
+     file = "outputs/merged_intervals_alaska_lake_ice.RData")
+
+
+## derive transition periods of breaking up and freezing up
+
+### to be done
+
+```
+
+
+## matching with in situ data
+
+```{r}
+
+load("outputs/merged_intervals_alaska_lake_ice.RData", verbose = T)
+landsat_ice_alaska = read_csv(file = "outputs/lake_ice_fraction_alaska_TOA_055013e04a0c436a9e62a0e45f7f4c18.csv")
+
+landsat_ice_alaska %>% skimr::skim()
+
+landsat_ice_alaska %>% 
+  filter(cloud <= 0.1) %>% 
+  ggplot(aes(x = doy, y = RFSnowIce)) + 
+  geom_hex(bins = 100, aes(fill = log(..count..))) +
+  scale_fill_viridis_c()
+  # geom_point(cex = 0.1, show.legend = F)
+
+landsat_ice_alaska = landsat_ice_alaska %>% 
+  na.omit() %>% 
+  filter(cloud < 0.1) %>% 
+  mutate(date = as.Date(substr(LANDSAT_SCENE_ID, start = 10, stop = 16), format = "%Y%j"))
+
+val = landsat_ice_alaska %>% 
+  pivot_longer(cols = c(RFSnowIce, FmaskSnowIce), names_to = "model", values_to = "ice_fraction")
+```
+
+### merge in situ and landsat ice data
+
+```{r}
+
+validation_alaska = val %>% 
+  right_join(merged_intervals, by = c("Long_DD", "Lat_DD")) %>% 
+  mutate(valid = case_when(date >= date1 & date <= date2 ~ "valid",
+                           TRUE ~ "invalid"))
+
+compare_fmask_slide_alaska = validation_alaska %>% 
+  pivot_wider(names_from = model, values_from = ice_fraction) %>% 
+  ggplot(aes(x = RFSnowIce, y = FmaskSnowIce)) +
+  geom_abline(aes(slope = 1, intercept = 0), color = "darkgrey") +
+  geom_point(aes(color = status), alpha = 0.7) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  coord_equal() +
+  labs(x = "ice fraction from SLIDE",
+       y = "ice fraction from Fmask",
+       color = "in situ\nderived condition") +
+  facet_wrap(~valid) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+compare_fmask_slide_alaska
+
+compare_fmask_slide_alaska %>% ggsave(filename = "figs/compare_fmask_slide_alaska.png",
+                                      width = 8, height = 5)
+
+validation_alaska_per_lake = validation_alaska %>%
+  ggplot(aes(x = yday(date), y = ice_fraction)) + 
+  # geom_point(aes(color = valid), alpha = 0.7) +
+  geom_vline(aes(xintercept = yday(date1)), lty = 2, alpha = 0.8) +
+  geom_vline(aes(xintercept = yday(date2)), lty = 2, alpha = 0.8) +
+  geom_point(aes(color = model), alpha = 0.7, cex = 0.5) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = "Day of the year",
+       y = NULL,
+       color = "Ice algorithms") +
+  facet_grid(valid~WaterbodyName) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+validation_alaska_per_lake
+
+validation_alaska_per_lake %>% ggsave(filename = "figs/validation_alaska_per_lake.png",
+                                      width = 7,
+                                      height = 4)
+```
+
+## reformat merged validation data to be merged with the results from GLRIP
+
+```{r}
+validation_alaska_reformatted = validation_alaska %>% 
+  filter(valid == "valid") %>% 
+  transmute(Hylak_id = Hylak_d,
+            lon = Long_DD,
+            lat = Lat_DD,
+            name = WtrbdyN,
+            LANDSAT_SCENE_ID = LANDSAT_SCENE_ID,
+            doy = doy,
+            cloud = cloud,
+            date = date,
+            model = model,
+            ice_fraction = ice_fraction,
+            id = Hylak_d,
+            date_start = date1,
+            date_end = date2,
+            `Ice cover` = status) %>% 
+  mutate(`Ice cover` = `Ice cover` == "ice_cover",
+         glrip_id = NA)
+
+save(validation_alaska_reformatted, file = "outputs/validation_alaska_reformatted.RData")
+```
+
+
